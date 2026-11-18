@@ -1,0 +1,36 @@
+name: X00TD macOS build check
+
+on:
+  workflow_dispatch:
+
+permissions: {}
+
+jobs:
+  toolchain:
+    runs-on: macos-15
+    timeout-minutes: 5
+    env:
+      DEVELOPER_DIR: /Applications/Xcode_16.4.app/Contents/Developer
+    steps:
+      - name: Check Xcode, iig, and ARM64 compilation
+        shell: bash
+        run: |
+          set -euo pipefail
+          sw_vers
+          xcodebuild -version
+          xcrun --find iig
+          sdk="$(xcrun --sdk macosx --show-sdk-path)"
+          printf 'macOS SDK: %s\n' "$sdk"
+
+          scratch="$(mktemp -d)"
+          printf 'int x00td_toolchain_probe(void) { return 16; }\n' > "$scratch/probe.c"
+          xcrun --sdk macosx clang -arch arm64 -ffreestanding -Werror -c "$scratch/probe.c" -o "$scratch/probe.o"
+          file "$scratch/probe.o"
+          xcrun lipo "$scratch/probe.o" -verify_arch arm64
+
+          headers="$sdk/System/Library/Frameworks/Kernel.framework/Versions/A/PrivateHeaders/platform"
+          if [[ -d "$headers" ]]; then
+            printf 'Kernel platform headers found in the SDK.\n'
+          else
+            printf 'Kernel platform headers absent from this SDK.\n'
+          fi
