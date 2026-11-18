@@ -165,6 +165,41 @@ jobs:
           PATCH
           printf '%s\n' 'ceb5959373012652c0da88dd46b4a05cee34d97e5feb7c002ca4f7e3149ab36b  dxb/patches/0012-x00td-4k-bootstrap.patch' | shasum -a 256 -c -
 
+          cat > dxb/patches/0013-x00td-4k-address-layout.patch <<'PATCH'
+          diff --git a/makedefs/MakeInc.def b/makedefs/MakeInc.def
+          --- a/makedefs/MakeInc.def
+          +++ b/makedefs/MakeInc.def
+          @@ -330,11 +330,13 @@
+           ARM64_PLKSEG_ADDR  =0xfffffff004004000
+           ARM64_LINK_ADDR    =0xfffffff007004000
+           
+          -# Use ARM_LARGE_MEMORY config for all MacOSX targets.
+          +# X00TD uses XNU's compact kernel layout for 4 KiB translation tables.
+          +ifneq ($(CURRENT_MACHINE_CONFIG),SWEET)
+           ifneq ($(filter $(PLATFORM),MacOSX),)
+           LARGE_MEMORY_DEFINE=-DARM_LARGE_MEMORY=1
+           ARM64_PLKSEG_ADDR  =0xfffffe0004004000
+           ARM64_LINK_ADDR    =0xfffffe0007004000
+          +endif
+           endif
+           
+           
+          diff --git a/osfmk/mach/arm/vm_param.h b/osfmk/mach/arm/vm_param.h
+          --- a/osfmk/mach/arm/vm_param.h
+          +++ b/osfmk/mach/arm/vm_param.h
+          @@ -133,7 +133,8 @@
+           
+           /* system-wide values */
+           #define MACH_VM_MIN_ADDRESS_RAW 0x0ULL
+          -#if defined(XNU_PLATFORM_MacOSX) || defined(XNU_PLATFORM_DriverKit)
+          +/* X00TD uses the existing 4 KiB ARM64 commpage nesting range. */
+          +#if (defined(XNU_PLATFORM_MacOSX) || defined(XNU_PLATFORM_DriverKit)) && !defined(ARM64_BOARD_CONFIG_SWEET)
+           #define MACH_VM_MAX_ADDRESS_RAW 0x00007FFFFE000000ULL
+           #else
+           #define MACH_VM_MAX_ADDRESS_RAW 0x0000000FC0000000ULL
+          PATCH
+          printf '%s\n' 'ea5ba746cc2efc6fbd1d9f9225df3ae307018fd6e3c2a26fb14c235b8425db13  dxb/patches/0013-x00td-4k-address-layout.patch' | shasum -a 256 -c -
+
           cat > dxb/patches/0141-sapphire-iorpc-kernelcontent.patch <<'PATCH'
           From c9c3ee8f11bcc2a372b70dee421c3719577dbe73 Mon Sep 17 00:00:00 2001
           From: x <x@x>
@@ -265,6 +300,25 @@ jobs:
           kernel=dxb/fakeroot/System/Library/Kernels/kernel.development.sweet
           test -s "$kernel"
           xcrun lipo "$kernel" -verify_arch arm64
+          python3 - "$kernel" <<'PY'
+          import struct
+          import sys
+          from pathlib import Path
+
+          kernel = Path(sys.argv[1]).read_bytes()
+          assert struct.unpack_from("<I", kernel)[0] == 0xfeedfacf, "Expected a thin Mach-O"
+          count, = struct.unpack_from("<I", kernel, 16)
+          offset = 32
+          for _ in range(count):
+              command, size = struct.unpack_from("<II", kernel, offset)
+              if command == 0x19 and kernel[offset + 8:offset + 24].rstrip(b"\0") == b"__TEXT":
+                  address, = struct.unpack_from("<Q", kernel, offset + 24)
+                  assert address == 0xfffffff007004000, f"Unexpected XNU link address {address:#x}"
+                  break
+              offset += size
+          else:
+              raise SystemExit("Missing Mach-O __TEXT segment")
+          PY
           mkdir -p out
           cp "$kernel" out/
           (cd out && shasum -a 256 kernel.development.sweet > SHA256SUMS)
