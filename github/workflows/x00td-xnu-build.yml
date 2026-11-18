@@ -1,0 +1,181 @@
+name: X00TD early XNU build
+
+on:
+  workflow_dispatch:
+
+permissions: {}
+
+jobs:
+  build:
+    runs-on: macos-15
+    timeout-minutes: 110
+    env:
+      DEVELOPER_DIR: /Applications/Xcode_16.4.app/Contents/Developer
+      MACOS_VERSION: "13.5"
+      KERNEL_CONFIG: DEVELOPMENT
+      MACHINE_CONFIG: SWEET
+    steps:
+      - name: Check and install build tools
+        shell: bash
+        run: |
+          set -euo pipefail
+          xcodebuild -version
+          xcrun --find iig
+          brew install gum xcodes
+          for tool in jq gum xcodes cmake ninja python3; do
+            command -v "$tool"
+          done
+
+      - name: Fetch pinned build sources and prepare patches
+        shell: bash
+        run: |
+          set -euo pipefail
+          fetch_revision() {
+            local directory="$1" remote="$2" revision="$3"
+            git init -q "$directory"
+            git -C "$directory" fetch --depth 1 "$remote" "$revision"
+            git -C "$directory" checkout --detach FETCH_HEAD
+            test "$(git -C "$directory" rev-parse HEAD)" = "$revision"
+          }
+          fetch_revision dxb https://github.com/blacktop/darwin-xnu-build.git 663906528d1cd5ea8fde7de6f16de73db9511549
+          fetch_revision sweet https://github.com/dipa-studio/ios-sweet.git 45263bee51df4a0f55cdf9c649af886399488ddb
+
+          python3 - <<'PY'
+          from hashlib import sha256
+          from pathlib import Path
+
+          upstream = Path("sweet/xnu/patches")
+          destination = Path("dxb/patches")
+          early = "0010-sweet-early-framebuffer-debug.patch"
+          relocate = "0012-sweet-keep-debug-console-after-ttbr0.patch"
+          expected = {
+              early: "892cbb941db7e19707d86e3ee30f1bfb2f35aa2d420ba24b5ae1d0058bdeae76",
+              relocate: "f3ce8513db86cc3a42add0a2e0da07459ffc4550b18a363e2d56988ded60020e",
+          }
+          for number in range(1, 13):
+              patch, = upstream.glob(f"{number:04d}-*.patch")
+              text = patch.read_text(encoding="utf-8")
+              if patch.name in expected:
+                  text = text.replace("(uintptr_t)0x9c000000", "(uintptr_t)0x9d400000")
+                  text = text.replace("#define EARLY_HEIGHT 2400u", "#define EARLY_HEIGHT 2160u")
+                  text = text.replace("Redmi Note 10 Pro bootstrap console", "ASUS X00TD bootstrap console")
+              if patch.name == early:
+                  text = text.replace("0x9c000000 + 2368 * 4320", "0x9d400000 + 2128 * 4320")
+                  text = text.replace("Splash framebuffer: one 32MB Normal-NC block in the EXISTING V=P",
+                                      "ASUS splash at 0x9d400000 inside the 0x9c000000 V=P")
+              if patch.name == relocate:
+                  text = text.replace("sweet_early_relocate(SWEET_EARLY_FB_VA);",
+                                      "sweet_early_relocate(SWEET_EARLY_FB_VA + 0x01400000ULL);")
+              data = text.encode("utf-8")
+              if patch.name in expected and sha256(data).hexdigest() != expected[patch.name]:
+                  raise SystemExit(f"Unexpected content for {patch.name}")
+              (destination / patch.name).write_bytes(data)
+          PY
+
+          cat > dxb/patches/0141-sapphire-iorpc-kernelcontent.patch <<'PATCH'
+          From c9c3ee8f11bcc2a372b70dee421c3719577dbe73 Mon Sep 17 00:00:00 2001
+          From: x <x@x>
+          Date: Tue, 20 Oct 2026 06:46:08 +0000
+          Subject: [PATCH] sapphire-0141: IORPC.kernelContent for Xcode 16+ iig
+          
+          Newer iig dispatch stubs take the decoded IORPCMessage from
+          IORPC.kernelContent (added in later xnu); xnu-8796 has no such field.
+          Add it (kernel only) and fill it where the kernel builds an IORPC from
+          a user message, as later xnu does, so the kernel builds with the
+          Xcode 16 that hosted macOS CI still offers.
+          ---
+           iokit/DriverKit/IORPC.h       | 5 +++++
+           iokit/IOKit/IORPC.h           | 5 +++++
+           iokit/Kernel/IOUserServer.cpp | 3 ++-
+           3 files changed, 12 insertions(+), 1 deletion(-)
+          
+          diff --git a/iokit/DriverKit/IORPC.h b/iokit/DriverKit/IORPC.h
+          index 3ded78c..c95c58c 100644
+          --- a/iokit/DriverKit/IORPC.h
+          +++ b/iokit/DriverKit/IORPC.h
+          @@ -224,6 +224,11 @@ struct IORPC {
+           	IORPCMessageMach * reply;
+           	uint32_t           sendSize;
+           	uint32_t           replySize;
+          +#ifdef KERNEL
+          +	/* sapphire: newer iig (Xcode 16+) dispatch stubs read the decoded
+          +	 * message from here instead of calling IORPCMessageFromMach() */
+          +	IORPCMessage     * kernelContent;
+          +#endif /* KERNEL */
+           };
+           typedef struct IORPC IORPC;
+           
+          diff --git a/iokit/IOKit/IORPC.h b/iokit/IOKit/IORPC.h
+          index 3ded78c..c95c58c 100644
+          --- a/iokit/IOKit/IORPC.h
+          +++ b/iokit/IOKit/IORPC.h
+          @@ -224,6 +224,11 @@ struct IORPC {
+           	IORPCMessageMach * reply;
+           	uint32_t           sendSize;
+           	uint32_t           replySize;
+          +#ifdef KERNEL
+          +	/* sapphire: newer iig (Xcode 16+) dispatch stubs read the decoded
+          +	 * message from here instead of calling IORPCMessageFromMach() */
+          +	IORPCMessage     * kernelContent;
+          +#endif /* KERNEL */
+           };
+           typedef struct IORPC IORPC;
+           
+          diff --git a/iokit/Kernel/IOUserServer.cpp b/iokit/Kernel/IOUserServer.cpp
+          index 5d1d922..1406bef 100644
+          --- a/iokit/Kernel/IOUserServer.cpp
+          +++ b/iokit/Kernel/IOUserServer.cpp
+          @@ -3209,7 +3209,7 @@ IOUserServer::server(ipc_kmsg_t requestkmsg, ipc_kmsg_t * pReply)
+           		msgout = (typeof(msgout))ikm_header(replykmsg);
+           	}
+           
+          -	IORPC rpc = { .message = msgin, .reply = msgout, .sendSize = msgin->msgh.msgh_size, .replySize = replyAlloc };
+          +	IORPC rpc = { .message = msgin, .reply = msgout, .sendSize = msgin->msgh.msgh_size, .replySize = replyAlloc, .kernelContent = message };
+           
+           	if (object) {
+           		kern_allocation_name_t prior;
+          @@ -3358,6 +3358,7 @@ IOUserServerUEXTTrap(OSObject * object, void * p1, void * p2, void * p3, void *
+           	rpc.sendSize  = mach->msgh.msgh_size;
+           	rpc.reply     = (IORPCMessageMach *) (p + inSize);
+           	rpc.replySize = ((uint32_t) (sizeof(buffer.buffer) - inSize));    // inSize was checked
+          +	rpc.kernelContent = message;
+           
+           	message->objects[0] = 0;
+           	if ((action = OSDynamicCast(OSAction, object))) {
+          -- 
+          2.43.0
+
+          PATCH
+          printf '%s\n' '781e1c06cbfe8c199f4c4bc86842338ba99a3684b6261c9d2987ccd9b32c3906  dxb/patches/0141-sapphire-iorpc-kernelcontent.patch' | shasum -a 256 -c -
+
+          # Include plain ARM64 in the build of libfirehose_kernel.
+          sed -i '' 's/ARCHS="x86_64 arm64e" VALID_ARCHS="x86_64 arm64e"/ARCHS="x86_64 arm64e arm64" VALID_ARCHS="x86_64 arm64e arm64"/' dxb/build.sh
+          grep -F 'VALID_ARCHS="x86_64 arm64e arm64"' dxb/build.sh
+
+      - name: Build XNU
+        working-directory: dxb
+        shell: bash
+        run: bash build.sh
+
+      - name: Verify the X00TD changes and collect the kernel
+        shell: bash
+        run: |
+          set -euo pipefail
+          grep -F '0x9d400000 + 2128 * 4320' dxb/xnu/osfmk/arm64/start.s
+          grep -F 'EARLY_HEIGHT 2160u' dxb/xnu/osfmk/arm64/sweet_early.c
+          grep -F 'SWEET_EARLY_FB_VA + 0x01400000ULL' dxb/xnu/osfmk/arm64/arm_vm_init.c
+          grep -F 'kernelContent' dxb/xnu/iokit/IOKit/IORPC.h
+          kernel=dxb/fakeroot/System/Library/Kernels/kernel.development.sweet
+          test -s "$kernel"
+          xcrun lipo "$kernel" -verify_arch arm64
+          mkdir -p out
+          cp "$kernel" out/
+          (cd out && shasum -a 256 kernel.development.sweet > SHA256SUMS)
+
+      - name: Upload the kernel and checksum
+        uses: actions/upload-artifact@v4
+        with:
+          name: x00td-xnu-early-kernel
+          path: out/
+          if-no-files-found: error
+          retention-days: 14
