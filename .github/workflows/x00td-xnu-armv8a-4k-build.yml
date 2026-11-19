@@ -1,0 +1,364 @@
+name: X00TD ARMv8-A 4 KiB XNU build
+
+on:
+  workflow_dispatch:
+
+permissions: {}
+
+jobs:
+  build:
+    runs-on: macos-15
+    timeout-minutes: 110
+    env:
+      DEVELOPER_DIR: /Applications/Xcode_16.4.app/Contents/Developer
+      MACOS_VERSION: "13.5"
+      KERNEL_CONFIG: DEVELOPMENT
+      MACHINE_CONFIG: SWEET
+    steps:
+      - name: Check and install build tools
+        shell: bash
+        run: |
+          set -euo pipefail
+          xcodebuild -version
+          xcrun --find iig
+          brew install gum xcodes
+          for tool in jq gum xcodes cmake ninja python3; do
+            command -v "$tool"
+          done
+
+      - name: Fetch pinned build sources and prepare patches
+        shell: bash
+        run: |
+          set -euo pipefail
+          fetch_revision() {
+            local directory="$1" remote="$2" revision="$3"
+            git init -q "$directory"
+            git -C "$directory" fetch --depth 1 "$remote" "$revision"
+            git -C "$directory" checkout --detach FETCH_HEAD
+            test "$(git -C "$directory" rev-parse HEAD)" = "$revision"
+          }
+          fetch_revision dxb https://github.com/blacktop/darwin-xnu-build.git 663906528d1cd5ea8fde7de6f16de73db9511549
+          fetch_revision sweet https://github.com/dipa-studio/ios-sweet.git 45263bee51df4a0f55cdf9c649af886399488ddb
+
+          python3 - <<'PY'
+          from hashlib import sha256
+          from pathlib import Path
+
+          upstream = Path("sweet/xnu/patches")
+          destination = Path("dxb/patches")
+          early = "0010-sweet-early-framebuffer-debug.patch"
+          expected = {
+              early: "892cbb941db7e19707d86e3ee30f1bfb2f35aa2d420ba24b5ae1d0058bdeae76",
+          }
+          for number in range(1, 12):
+              patch, = upstream.glob(f"{number:04d}-*.patch")
+              text = patch.read_text(encoding="utf-8")
+              if patch.name in expected:
+                  text = text.replace("(uintptr_t)0x9c000000", "(uintptr_t)0x9d400000")
+                  text = text.replace("#define EARLY_HEIGHT 2400u", "#define EARLY_HEIGHT 2160u")
+                  text = text.replace("Redmi Note 10 Pro bootstrap console", "ASUS X00TD bootstrap console")
+              if patch.name == early:
+                  text = text.replace("0x9c000000 + 2368 * 4320", "0x9d400000 + 2128 * 4320")
+                  text = text.replace("Splash framebuffer: one 32MB Normal-NC block in the EXISTING V=P",
+                                      "ASUS splash at 0x9d400000 inside the 0x9c000000 V=P")
+              data = text.encode("utf-8")
+              if patch.name in expected and sha256(data).hexdigest() != expected[patch.name]:
+                  raise SystemExit(f"Unexpected content for {patch.name}")
+              (destination / patch.name).write_bytes(data)
+          PY
+
+          cat > dxb/patches/0012-x00td-4k-bootstrap.patch <<'PATCH'
+          diff --git a/osfmk/arm64/start.s b/osfmk/arm64/start.s
+          --- a/osfmk/arm64/start.s
+          +++ b/osfmk/arm64/start.s
+          @@ -629,20 +629,44 @@
+           	create_bootstrap_mapping x14, x15, x5, x3, x2, x9, x10, x11, x12, x13
+           
+           #if defined(SWEET)
+          -	/*
+          -	 * ASUS splash at 0x9d400000 inside the 0x9c000000 V=P
+          -	 * L2 table. Both framebuffer and RAM use L1 index 0; another call to
+          -	 * create_bootstrap_mapping would replace the RAM L2 table.
+          -	 * SWEET uses 16K pages and all bring-up RAM is below 4GB, so the first
+          -	 * V=P L2 page is bootstrap_pagetables + 2*PGBYTES.
+          -	 */
+          -	MOV64	x10, 0x9c000000
+          +	/* Map the 1080x2160 splash with five 2 MiB identity blocks.
+          +	 * A 4 KiB L1 table covers 1 GiB per entry, so RAM and the splash
+          +	 * can use different L2 tables.
+          +	 */
+          +	MOV64	x10, 0x9d400000
+          +	and	x12, x10, #(ARM_TT_L1_INDEX_MASK)
+          +	lsr	x12, x12, #(ARM_TT_L1_SHIFT)
+          +	ldr	x13, [x1, x12, lsl #TTE_SHIFT]
+          +	tst	x13, #(ARM_TTE_VALID)
+          +	b.ne	Lx00td_fb_existing_l2
+          +
+          +	adrp	x13, EXT(x00td_framebuffer_l2)@page
+          +	add	x13, x13, EXT(x00td_framebuffer_l2)@pageoff
+          +	mov	x16, x13
+          +	mov	x17, #(TTE_PGENTRIES)
+          +Lx00td_fb_clear_l2:
+          +	str	xzr, [x16], #8
+          +	subs	x17, x17, #1
+          +	b.ne	Lx00td_fb_clear_l2
+          +	create_l1_table_entry x10, x1, x13, x11, x16, x17
+          +	b	Lx00td_fb_map_blocks
+          +
+          +Lx00td_fb_existing_l2:
+          +	and	x13, x13, #(ARM_TTE_TABLE_MASK)
+          +
+          +Lx00td_fb_map_blocks:
+          +	and	x12, x10, #(ARM_TT_L2_INDEX_MASK)
+          +	lsr	x12, x12, #(ARM_TT_L2_SHIFT)
+          +	add	x13, x13, x12, lsl #TTE_SHIFT
+           	MOV64	x11, (ARM_TTE_TYPE_BLOCK | ARM_TTE_VALID | ARM_TTE_BLOCK_SH(SH_OUTER_MEMORY) | ARM_TTE_BLOCK_ATTRINDX(CACHE_ATTRINDX_WRITECOMB) | ARM_TTE_BLOCK_AF | ARM_TTE_BLOCK_PNX | ARM_TTE_BLOCK_NX)
+          -	orr		x11, x11, x10
+          -	and		x12, x10, #(ARM_TT_L2_INDEX_MASK)
+          -	lsr		x12, x12, #(ARM_TT_L2_SHIFT)
+          -	add		x13, x25, #(2 * PGBYTES)
+          -	str		x11, [x13, x12, lsl #TTE_SHIFT]
+          +	orr	x11, x11, x10
+          +	mov	x16, #5
+          +	mov	x17, #(ARM_TT_L2_SIZE)
+          +Lx00td_fb_map_next:
+          +	str	x11, [x13], #8
+          +	add	x11, x11, x17
+          +	subs	x16, x16, #1
+          +	b.ne	Lx00td_fb_map_next
+           #endif
+           
+           	/* Ensure TTEs are visible */
+          diff --git a/osfmk/arm64/sweet_early.c b/osfmk/arm64/sweet_early.c
+          --- a/osfmk/arm64/sweet_early.c
+          +++ b/osfmk/arm64/sweet_early.c
+          @@ -23,6 +23,9 @@
+           #define EARLY_COLS (EARLY_WIDTH / EARLY_CELL_W)
+           
+           extern unsigned char iso_font[256 * 16];
+          +
+          +/* Temporary identity map, used only until arm_vm_init replaces TTBR0. */
+          +uint64_t x00td_framebuffer_l2[512] __attribute__((aligned(4096)));
+           
+           /* Initialized data must remain writable until disable, including panics. */
+           static unsigned int early_row, early_col;
+          diff --git a/pexpert/pexpert/arm64/SWEET.h b/pexpert/pexpert/arm64/SWEET.h
+          --- a/pexpert/pexpert/arm64/SWEET.h
+          +++ b/pexpert/pexpert/arm64/SWEET.h
+          @@ -3,7 +3,7 @@
+            * Snapdragon 732G): Kryo 470 = Cortex-A76 + Cortex-A55, ARMv8.2, no PAC.
+            *
+            * Generic ARM like BCM2837 (no APPLE_ARM64_ARCH_FAMILY: none of Apple's
+          - * implementation-defined system registers exist), 16K pages and GICv3 like
+          + * implementation-defined system registers exist), with X00TD 4 KiB pages and GICv3 like
+            * VMAPPLE. Unlike VMAPPLE the GIC has two security states (GICD_TYPER
+            * SecurityExtn=1): Group 0 belongs to TrustZone, so every interrupt,
+            * including the timer, is a Group 1 IRQ taken through sleh_irq().
+          @@ -26,7 +26,6 @@
+           #define __ARM_ENABLE_SWAP__       1
+           #define __ARM_V8_CRYPTO_EXTENSIONS__ 1
+           #define __ARM_PAN_AVAILABLE__     1
+          -#define __ARM_16K_PG__            1
+           
+           #define HAS_GIC_V3                1
+           
+          PATCH
+          printf '%s\n' 'ceb5959373012652c0da88dd46b4a05cee34d97e5feb7c002ca4f7e3149ab36b  dxb/patches/0012-x00td-4k-bootstrap.patch' | shasum -a 256 -c -
+
+          cat > dxb/patches/0013-x00td-4k-address-layout.patch <<'PATCH'
+          diff --git a/makedefs/MakeInc.def b/makedefs/MakeInc.def
+          --- a/makedefs/MakeInc.def
+          +++ b/makedefs/MakeInc.def
+          @@ -330,11 +330,13 @@
+           ARM64_PLKSEG_ADDR  =0xfffffff004004000
+           ARM64_LINK_ADDR    =0xfffffff007004000
+           
+          -# Use ARM_LARGE_MEMORY config for all MacOSX targets.
+          +# X00TD uses XNU's compact kernel layout for 4 KiB translation tables.
+          +ifneq ($(CURRENT_MACHINE_CONFIG),SWEET)
+           ifneq ($(filter $(PLATFORM),MacOSX),)
+           LARGE_MEMORY_DEFINE=-DARM_LARGE_MEMORY=1
+           ARM64_PLKSEG_ADDR  =0xfffffe0004004000
+           ARM64_LINK_ADDR    =0xfffffe0007004000
+          +endif
+           endif
+           
+           
+          diff --git a/osfmk/mach/arm/vm_param.h b/osfmk/mach/arm/vm_param.h
+          --- a/osfmk/mach/arm/vm_param.h
+          +++ b/osfmk/mach/arm/vm_param.h
+          @@ -133,7 +133,8 @@
+           
+           /* system-wide values */
+           #define MACH_VM_MIN_ADDRESS_RAW 0x0ULL
+          -#if defined(XNU_PLATFORM_MacOSX) || defined(XNU_PLATFORM_DriverKit)
+          +/* X00TD uses the existing 4 KiB ARM64 commpage nesting range. */
+          +#if (defined(XNU_PLATFORM_MacOSX) || defined(XNU_PLATFORM_DriverKit)) && !defined(ARM64_BOARD_CONFIG_SWEET)
+           #define MACH_VM_MAX_ADDRESS_RAW 0x00007FFFFE000000ULL
+           #else
+           #define MACH_VM_MAX_ADDRESS_RAW 0x0000000FC0000000ULL
+          PATCH
+          printf '%s\n' 'ea5ba746cc2efc6fbd1d9f9225df3ae307018fd6e3c2a26fb14c235b8425db13  dxb/patches/0013-x00td-4k-address-layout.patch' | shasum -a 256 -c -
+
+          cat > dxb/patches/0014-x00td-armv8-baseline.patch <<'PATCH'
+          diff --git a/makedefs/MakeInc.def b/makedefs/MakeInc.def
+          --- a/makedefs/MakeInc.def
+          +++ b/makedefs/MakeInc.def
+          @@ -61,7 +61,7 @@
+           MACHINE_FLAGS_ARM64_T6000 = -DARM64_BOARD_CONFIG_T6000 		-mcpu=apple-a14
+           MACHINE_FLAGS_ARM64_VMAPPLE = -DARM64_BOARD_CONFIG_VMAPPLE              -march=armv8.5a
+           MACHINE_FLAGS_ARM64_BCM2837 = -DARM64_BOARD_CONFIG_BCM2837
+          -MACHINE_FLAGS_ARM64_SWEET = -DARM64_BOARD_CONFIG_SWEET                -march=armv8.2-a+crypto
+          +MACHINE_FLAGS_ARM64_SWEET = -DARM64_BOARD_CONFIG_SWEET                -march=armv8-a+crypto
+           
+           
+           #
+          PATCH
+          printf '%s\n' '2180f5be255000b6f96118a82b6d1554d77542be394080b5a0e2c474aa993f2f  dxb/patches/0014-x00td-armv8-baseline.patch' | shasum -a 256 -c -
+
+          cat > dxb/patches/0141-sapphire-iorpc-kernelcontent.patch <<'PATCH'
+          From c9c3ee8f11bcc2a372b70dee421c3719577dbe73 Mon Sep 17 00:00:00 2001
+          From: x <x@x>
+          Date: Tue, 20 Oct 2026 06:46:08 +0000
+          Subject: [PATCH] sapphire-0141: IORPC.kernelContent for Xcode 16+ iig
+          
+          Newer iig dispatch stubs take the decoded IORPCMessage from
+          IORPC.kernelContent (added in later xnu); xnu-8796 has no such field.
+          Add it (kernel only) and fill it where the kernel builds an IORPC from
+          a user message, as later xnu does, so the kernel builds with the
+          Xcode 16 that hosted macOS CI still offers.
+          ---
+           iokit/DriverKit/IORPC.h       | 5 +++++
+           iokit/IOKit/IORPC.h           | 5 +++++
+           iokit/Kernel/IOUserServer.cpp | 3 ++-
+           3 files changed, 12 insertions(+), 1 deletion(-)
+          
+          diff --git a/iokit/DriverKit/IORPC.h b/iokit/DriverKit/IORPC.h
+          index 3ded78c..c95c58c 100644
+          --- a/iokit/DriverKit/IORPC.h
+          +++ b/iokit/DriverKit/IORPC.h
+          @@ -224,6 +224,11 @@ struct IORPC {
+           	IORPCMessageMach * reply;
+           	uint32_t           sendSize;
+           	uint32_t           replySize;
+          +#ifdef KERNEL
+          +	/* sapphire: newer iig (Xcode 16+) dispatch stubs read the decoded
+          +	 * message from here instead of calling IORPCMessageFromMach() */
+          +	IORPCMessage     * kernelContent;
+          +#endif /* KERNEL */
+           };
+           typedef struct IORPC IORPC;
+           
+          diff --git a/iokit/IOKit/IORPC.h b/iokit/IOKit/IORPC.h
+          index 3ded78c..c95c58c 100644
+          --- a/iokit/IOKit/IORPC.h
+          +++ b/iokit/IOKit/IORPC.h
+          @@ -224,6 +224,11 @@ struct IORPC {
+           	IORPCMessageMach * reply;
+           	uint32_t           sendSize;
+           	uint32_t           replySize;
+          +#ifdef KERNEL
+          +	/* sapphire: newer iig (Xcode 16+) dispatch stubs read the decoded
+          +	 * message from here instead of calling IORPCMessageFromMach() */
+          +	IORPCMessage     * kernelContent;
+          +#endif /* KERNEL */
+           };
+           typedef struct IORPC IORPC;
+           
+          diff --git a/iokit/Kernel/IOUserServer.cpp b/iokit/Kernel/IOUserServer.cpp
+          index 5d1d922..1406bef 100644
+          --- a/iokit/Kernel/IOUserServer.cpp
+          +++ b/iokit/Kernel/IOUserServer.cpp
+          @@ -3209,7 +3209,7 @@ IOUserServer::server(ipc_kmsg_t requestkmsg, ipc_kmsg_t * pReply)
+           		msgout = (typeof(msgout))ikm_header(replykmsg);
+           	}
+           
+          -	IORPC rpc = { .message = msgin, .reply = msgout, .sendSize = msgin->msgh.msgh_size, .replySize = replyAlloc };
+          +	IORPC rpc = { .message = msgin, .reply = msgout, .sendSize = msgin->msgh.msgh_size, .replySize = replyAlloc, .kernelContent = message };
+           
+           	if (object) {
+           		kern_allocation_name_t prior;
+          @@ -3358,6 +3358,7 @@ IOUserServerUEXTTrap(OSObject * object, void * p1, void * p2, void * p3, void *
+           	rpc.sendSize  = mach->msgh.msgh_size;
+           	rpc.reply     = (IORPCMessageMach *) (p + inSize);
+           	rpc.replySize = ((uint32_t) (sizeof(buffer.buffer) - inSize));    // inSize was checked
+          +	rpc.kernelContent = message;
+           
+           	message->objects[0] = 0;
+           	if ((action = OSDynamicCast(OSAction, object))) {
+          -- 
+          2.43.0
+
+          PATCH
+          printf '%s\n' '781e1c06cbfe8c199f4c4bc86842338ba99a3684b6261c9d2987ccd9b32c3906  dxb/patches/0141-sapphire-iorpc-kernelcontent.patch' | shasum -a 256 -c -
+
+          # Include plain ARM64 in the build of libfirehose_kernel.
+          sed -i '' 's/ARCHS="x86_64 arm64e" VALID_ARCHS="x86_64 arm64e"/ARCHS="x86_64 arm64e arm64" VALID_ARCHS="x86_64 arm64e arm64"/' dxb/build.sh
+          grep -F 'VALID_ARCHS="x86_64 arm64e arm64"' dxb/build.sh
+
+      - name: Build XNU
+        working-directory: dxb
+        shell: bash
+        run: bash build.sh
+
+      - name: Verify the X00TD changes and collect the kernel
+        shell: bash
+        run: |
+          set -euo pipefail
+          grep -F '0x9d400000 + 2128 * 4320' dxb/xnu/osfmk/arm64/start.s
+          grep -F 'EARLY_HEIGHT 2160u' dxb/xnu/osfmk/arm64/sweet_early.c
+          if grep -E '^#define[[:space:]]+__ARM_16K_PG__' dxb/xnu/pexpert/pexpert/arm64/SWEET.h; then
+            exit 1
+          fi
+          grep -F 'Lx00td_fb_map_next:' dxb/xnu/osfmk/arm64/start.s
+          grep -F 'MACHINE_FLAGS_ARM64_SWEET = -DARM64_BOARD_CONFIG_SWEET                -march=armv8-a+crypto' dxb/xnu/makedefs/MakeInc.def
+          grep -F 'sweet_early_disable();' dxb/xnu/osfmk/arm64/arm_vm_init.c
+          grep -F 'kernelContent' dxb/xnu/iokit/IOKit/IORPC.h
+          kernel=dxb/fakeroot/System/Library/Kernels/kernel.development.sweet
+          test -s "$kernel"
+          xcrun lipo "$kernel" -verify_arch arm64
+          python3 - "$kernel" <<'PY'
+          import struct
+          import sys
+          from pathlib import Path
+
+          kernel = Path(sys.argv[1]).read_bytes()
+          assert struct.unpack_from("<I", kernel)[0] == 0xfeedfacf, "Expected a thin Mach-O"
+          count, = struct.unpack_from("<I", kernel, 16)
+          offset = 32
+          for _ in range(count):
+              command, size = struct.unpack_from("<II", kernel, offset)
+              if command == 0x19 and kernel[offset + 8:offset + 24].rstrip(b"\0") == b"__TEXT":
+                  address, = struct.unpack_from("<Q", kernel, offset + 24)
+                  assert address == 0xfffffff007004000, f"Unexpected XNU link address {address:#x}"
+                  break
+              offset += size
+          else:
+              raise SystemExit("Missing Mach-O __TEXT segment")
+          PY
+          mkdir -p out
+          cp "$kernel" out/
+          python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          info = {
+              "workflow": "X00TD ARMv8-A 4 KiB XNU build",
+              "commit": os.environ["GITHUB_SHA"],
+              "run_id": os.environ["GITHUB_RUN_ID"],
+              "run_attempt": os.environ["GITHUB_RUN_ATTEMPT"],
+              "compiler_target": "armv8-a+crypto",
+              "translation_page_bytes": 4096,
+          }
+          Path("out/BUILD_INFO.json").write_text(json.dumps(info, indent=2) + "\n")
+          PY
+          (cd out && shasum -a 256 kernel.development.sweet > SHA256SUMS)
+
+      - name: Upload the kernel and checksum
+        uses: actions/upload-artifact@v4
+        with:
+          name: x00td-xnu-armv8a-4k-kernel
+          path: out/
+          if-no-files-found: error
+          retention-days: 14
