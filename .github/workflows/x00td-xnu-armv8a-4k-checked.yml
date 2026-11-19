@@ -287,6 +287,51 @@ jobs:
           PATCH
           printf '%s\n' '24291e5f94b447f160284ef8368cfc71c9e15c35b0af695cb6142182ac173dd1  dxb/patches/0016-x00td-baseline-pan-config.patch' | shasum -a 256 -c -
 
+          cat > dxb/patches/0017-x00td-commpage-baseline-atomics.patch <<'PATCH'
+          diff --git a/osfmk/arm/commpage/commpage_asm.s b/osfmk/arm/commpage/commpage_asm.s
+          --- a/osfmk/arm/commpage/commpage_asm.s
+          +++ b/osfmk/arm/commpage/commpage_asm.s
+          @@ -273,7 +273,18 @@
+           	mov		w11, #1			 // locked value = w11 = 1
+           
+           	// Try to grab the lock
+          +#if defined(ARM64_BOARD_CONFIG_SWEET)
+          +	/* One try, with only forward branches inside the preemption-free zone. */
+          +	ldaxr	w10, [x3]
+          +	cbnz	w10, Lx00td_enqueue_lock_held
+          +	stxr	w10, w11, [x3]
+          +	b	Lx00td_enqueue_lock_result
+          +Lx00td_enqueue_lock_held:
+          +	clrex
+          +Lx00td_enqueue_lock_result:
+          +#else
+           	casa	w10, w11, [x3]	 // Atomic CAS with acquire barrier
+          +#endif
+           	cbz		w10, Ltrylock_enqueue_success
+           
+           	mov		x0, #-1			// Failed
+          @@ -323,7 +334,18 @@
+           	mov		w10, wzr		 // unlock value = w10 = 0
+           	mov		w11, #1			 // locked value = w11 = 1
+           
+          +#if defined(ARM64_BOARD_CONFIG_SWEET)
+          +	/* One try, with only forward branches inside the preemption-free zone. */
+          +	ldaxr	w10, [x2]
+          +	cbnz	w10, Lx00td_dequeue_lock_held
+          +	stxr	w10, w11, [x2]
+          +	b	Lx00td_dequeue_lock_result
+          +Lx00td_dequeue_lock_held:
+          +	clrex
+          +Lx00td_dequeue_lock_result:
+          +#else
+           	casa	w10, w11, [x2]	 // Atomic CAS with acquire barrier
+          +#endif
+           	cbz		w10, Ltrylock_dequeue_success
+           
+           	mov		x0, #-1			// Failed
+          PATCH
+          printf '%s\n' 'b7feb541f42a21b9c384473f4b50ce8aba852929a8e328fa19e0e5e657cfe6fb  dxb/patches/0017-x00td-commpage-baseline-atomics.patch' | shasum -a 256 -c -
+
           cat > dxb/patches/0141-sapphire-iorpc-kernelcontent.patch <<'PATCH'
           From c9c3ee8f11bcc2a372b70dee421c3719577dbe73 Mon Sep 17 00:00:00 2001
           From: x <x@x>
@@ -428,6 +473,14 @@ jobs:
           assembly = (output / "board-probe.s").read_text()
           assert not re.search(r"\bpan\b", assembly), "Board probe still uses PAN"
           print("PASS: the patched board header and original XNU copyio helpers compile for baseline ARMv8-A.")
+          commpage = root / "xnu/osfmk/arm/commpage/commpage_asm.s"
+          assembly_flags = flags + [
+              "-DARM64_BOARD_CONFIG_SWEET", "-DASSEMBLER", "-D__ASSEMBLER__",
+              "-I", str(root / "xnu/osfmk"), "-x", "assembler-with-cpp",
+          ]
+          subprocess.run(["xcrun", "clang", *assembly_flags, "-c", str(commpage),
+                          "-o", str(output / "commpage-baseline.o")], check=True)
+          print("PASS: the complete patched commpage assembly compiles with LSE disabled.")
           PY
 
       - name: Build XNU
@@ -569,6 +622,7 @@ jobs:
               "cpu": "cortex-a53",
               "lse_disabled": True,
               "hardware_pan": False,
+              "commpage_baseline_atomics": True,
               "translation_page_bytes": 4096,
           }
           Path("out/BUILD_INFO.json").write_text(json.dumps(info, indent=2) + "\n")
