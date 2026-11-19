@@ -270,6 +270,23 @@ jobs:
           PATCH
           printf '%s\n' '3566f41bb64a96d583472fdadb763c10ae9a59f32701b9e1d6969bb9901c09ca  dxb/patches/0015-x00td-disable-lse-codegen.patch' | shasum -a 256 -c -
 
+          cat > dxb/patches/0016-x00td-baseline-pan-config.patch <<'PATCH'
+          diff --git a/pexpert/pexpert/arm64/SWEET.h b/pexpert/pexpert/arm64/SWEET.h
+          --- a/pexpert/pexpert/arm64/SWEET.h
+          +++ b/pexpert/pexpert/arm64/SWEET.h
+          @@ -25,7 +25,8 @@
+           #define __ARM_DEBUG__             7
+           #define __ARM_ENABLE_SWAP__       1
+           #define __ARM_V8_CRYPTO_EXTENSIONS__ 1
+          -#define __ARM_PAN_AVAILABLE__     1
+          +/* Baseline ARMv8-A configuration uses XNU's paths without hardware PAN. */
+          +#define __ARM_PAN_AVAILABLE__     0
+           
+           #define HAS_GIC_V3                1
+           
+          PATCH
+          printf '%s\n' '24291e5f94b447f160284ef8368cfc71c9e15c35b0af695cb6142182ac173dd1  dxb/patches/0016-x00td-baseline-pan-config.patch' | shasum -a 256 -c -
+
           cat > dxb/patches/0141-sapphire-iorpc-kernelcontent.patch <<'PATCH'
           From c9c3ee8f11bcc2a372b70dee421c3719577dbe73 Mon Sep 17 00:00:00 2001
           From: x <x@x>
@@ -365,7 +382,52 @@ jobs:
                                   ;;
                           esac'''
           assert text.count(warning) == 1, "Pinned patch loop changed"
-          script.write_text(text.replace(warning, replacement))
+          text = text.replace(warning, replacement)
+          hook = '    patches\n    venv\n'
+          assert text.count(hook) == 1, "Pinned build entry points changed"
+          text = text.replace(hook, '    patches\n    python3 "${WORK_DIR}/x00td-board-preflight.py"\n    venv\n')
+          script.write_text(text)
+          PY
+
+          cat > dxb/x00td-board-preflight.py <<'PY'
+          from pathlib import Path
+          import re
+          import subprocess
+          
+          root = Path(__file__).resolve().parent
+          output = root.parent / "preflight"
+          output.mkdir(exist_ok=True)
+          copyio = (root / "xnu/osfmk/arm64/copyio.c").read_text()
+          helpers = re.findall(
+              r"static inline void\s+user_access_(?:enable|disable)\(void\)\s*\{.*?\n\}",
+              copyio, re.S,
+          )
+          assert len(helpers) == 2, "Expected both original XNU user-access helpers"
+          probe = output / "board-probe.c"
+          source = """#include <pexpert/arm64/SWEET.h>
+          #if __ARM_PAN_AVAILABLE__
+          #error Baseline X00TD must use the configuration without hardware PAN
+          #endif
+          #ifdef __ARM_16K_PG__
+          #error X00TD requires 4 KiB translation tables
+          #endif
+          #define assert(expression) do { if (!(expression)) __builtin_trap(); } while (0)
+          """
+          source += "\n".join(helpers)
+          source += "\nvoid x00td_board_probe(void) { user_access_enable(); user_access_disable(); }\n"
+          probe.write_text(source)
+          flags = [
+              "-target", "arm64-apple-macos15.5", "-arch", "arm64",
+              "-march=armv8-a+crypto", "-mcpu=cortex-a53", "-mno-outline-atomics",
+              "-Xclang", "-target-feature", "-Xclang", "-lse",
+              "-O0", "-ffreestanding", "-fno-stack-protector",
+              "-I", str(root / "xnu/pexpert"),
+          ]
+          subprocess.run(["xcrun", "clang", *flags, "-S", str(probe),
+                          "-o", str(output / "board-probe.s")], check=True)
+          assembly = (output / "board-probe.s").read_text()
+          assert not re.search(r"\bpan\b", assembly), "Board probe still uses PAN"
+          print("PASS: the patched board header and original XNU copyio helpers compile for baseline ARMv8-A.")
           PY
 
       - name: Build XNU
@@ -506,6 +568,7 @@ jobs:
               "compiler_target": "armv8-a+crypto",
               "cpu": "cortex-a53",
               "lse_disabled": True,
+              "hardware_pan": False,
               "translation_page_bytes": 4096,
           }
           Path("out/BUILD_INFO.json").write_text(json.dumps(info, indent=2) + "\n")
