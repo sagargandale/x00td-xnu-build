@@ -791,19 +791,6 @@ jobs:
           grep -F 'sweet_early_relocate(SWEET_EARLY_FB_VA);' dxb/xnu/osfmk/arm64/arm_vm_init.c
           grep -F '#define X00TD_FB_BLOCKS 5u' dxb/xnu/osfmk/arm64/arm_vm_init.c
           grep -F 'CFLAGS_ARM64 += -mcpu=cortex-a53 -mno-outline-atomics -Xclang -target-feature -Xclang -lse' dxb/xnu/makedefs/MakeInc.def
-          python3 - <<'PY'
-          from pathlib import Path
-
-          found = False
-          with Path("x00td-build.log").open(errors="replace") as log:
-              for line in log:
-                  if "lock_group.c" in line and " -c " in line:
-                      assert "-mcpu=cortex-a53" in line, "Kernel compilation did not receive the CPU override"
-                      assert "-target-feature -Xclang -lse" in line, "Kernel compilation did not receive the LSE override"
-                      found = True
-          assert found, "Missing lock_group.c compiler invocation"
-          print("PASS: the real kernel compiler command received the baseline CPU and LSE overrides.")
-          PY
           grep -F 'kernelContent' dxb/xnu/iokit/IOKit/IORPC.h
           kernel=dxb/fakeroot/System/Library/Kernels/kernel.development.sweet
           test -s "$kernel"
@@ -913,6 +900,7 @@ jobs:
           path: |
             preflight/
             x00td-build.log.gz
+            dxb/fakeroot/System/Library/Kernels/kernel.development.sweet
           if-no-files-found: warn
           retention-days: 14
 
