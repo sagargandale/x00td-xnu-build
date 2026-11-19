@@ -200,6 +200,22 @@ jobs:
           PATCH
           printf '%s\n' 'ea5ba746cc2efc6fbd1d9f9225df3ae307018fd6e3c2a26fb14c235b8425db13  dxb/patches/0013-x00td-4k-address-layout.patch' | shasum -a 256 -c -
 
+          cat > dxb/patches/0014-x00td-armv8-baseline.patch <<'PATCH'
+          diff --git a/makedefs/MakeInc.def b/makedefs/MakeInc.def
+          --- a/makedefs/MakeInc.def
+          +++ b/makedefs/MakeInc.def
+          @@ -61,7 +61,7 @@
+           MACHINE_FLAGS_ARM64_T6000 = -DARM64_BOARD_CONFIG_T6000 		-mcpu=apple-a14
+           MACHINE_FLAGS_ARM64_VMAPPLE = -DARM64_BOARD_CONFIG_VMAPPLE              -march=armv8.5a
+           MACHINE_FLAGS_ARM64_BCM2837 = -DARM64_BOARD_CONFIG_BCM2837
+          -MACHINE_FLAGS_ARM64_SWEET = -DARM64_BOARD_CONFIG_SWEET                -march=armv8.2-a+crypto
+          +MACHINE_FLAGS_ARM64_SWEET = -DARM64_BOARD_CONFIG_SWEET                -march=armv8-a+crypto
+           
+           
+           #
+          PATCH
+          printf '%s\n' '2180f5be255000b6f96118a82b6d1554d77542be394080b5a0e2c474aa993f2f  dxb/patches/0014-x00td-armv8-baseline.patch' | shasum -a 256 -c -
+
           cat > dxb/patches/0141-sapphire-iorpc-kernelcontent.patch <<'PATCH'
           From c9c3ee8f11bcc2a372b70dee421c3719577dbe73 Mon Sep 17 00:00:00 2001
           From: x <x@x>
@@ -295,6 +311,7 @@ jobs:
             exit 1
           fi
           grep -F 'Lx00td_fb_map_next:' dxb/xnu/osfmk/arm64/start.s
+          grep -F 'MACHINE_FLAGS_ARM64_SWEET = -DARM64_BOARD_CONFIG_SWEET                -march=armv8-a+crypto' dxb/xnu/makedefs/MakeInc.def
           grep -F 'sweet_early_disable();' dxb/xnu/osfmk/arm64/arm_vm_init.c
           grep -F 'kernelContent' dxb/xnu/iokit/IOKit/IORPC.h
           kernel=dxb/fakeroot/System/Library/Kernels/kernel.development.sweet
