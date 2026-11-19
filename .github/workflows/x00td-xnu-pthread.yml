@@ -1,0 +1,2234 @@
+name: X00TD pthread and IRQ build
+
+on:
+  workflow_dispatch:
+
+permissions: {}
+
+jobs:
+  build:
+    runs-on: macos-15
+    timeout-minutes: 110
+    env:
+      DEVELOPER_DIR: /Applications/Xcode_16.4.app/Contents/Developer
+      MACOS_VERSION: "13.5"
+      KERNEL_CONFIG: DEVELOPMENT
+      ARCH_CONFIG: ARM64
+      MACHINE_CONFIG: SWEET
+    steps:
+      - name: Check Xcode atomic code generation and install tools
+        shell: bash
+        run: |
+          set -euo pipefail
+          xcodebuild -version
+          xcrun --find iig
+          mkdir -p preflight
+          cat > preflight/atomic-probe.c <<'C'
+          #if defined(__ARM_FEATURE_ATOMICS)
+          #error LSE must be disabled for X00TD
+          #endif
+          unsigned add(unsigned *p) {
+              return __atomic_fetch_add(p, 1u, __ATOMIC_RELAXED);
+          }
+          unsigned exchange(unsigned *p) {
+              return __atomic_exchange_n(p, 1u, __ATOMIC_ACQ_REL);
+          }
+          _Bool compare_exchange(unsigned *p, unsigned *expected, unsigned desired) {
+              return __atomic_compare_exchange_n(p, expected, desired, 0,
+                                                 __ATOMIC_ACQ_REL, __ATOMIC_RELAXED);
+          }
+          C
+          xcrun clang -target arm64-apple-macos15.5 -arch arm64 \
+            -march=armv8-a+crypto -mcpu=cortex-a53 -mno-outline-atomics \
+            -Xclang -target-feature -Xclang -lse \
+            -O2 -ffreestanding -fno-stack-protector \
+            -S preflight/atomic-probe.c -o preflight/atomic-probe.s
+          python3 - <<'PY'
+          import re
+          from pathlib import Path
+
+          assembly = Path("preflight/atomic-probe.s").read_text()
+          forbidden = r"^\s*(?:ldadd\w*|ldclr\w*|ldeor\w*|ldset\w*|ldsmax\w*|ldsmin\w*|ldumax\w*|ldumin\w*|swp\w*|cas\w*)\s"
+          assert not re.search(forbidden, assembly, re.M), "Preflight emitted an LSE atomic"
+          assert "__aarch64_" not in assembly, "Preflight emitted outline atomic helpers"
+          for instruction in ("ldxr", "stxr", "ldaxr", "stlxr"):
+              assert re.search(r"^\s*" + instruction + r"\s", assembly, re.M), instruction
+          print("PASS: Xcode emits inline ARMv8-A exclusive loops for all three atomic probes.")
+          PY
+          brew install gum xcodes
+          for tool in jq gum xcodes cmake ninja python3; do
+            command -v "$tool"
+          done
+
+      - name: Fetch pinned build sources and prepare patches
+        shell: bash
+        run: |
+          set -euo pipefail
+          fetch_revision() {
+            local directory="$1" remote="$2" revision="$3"
+            git init -q "$directory"
+            git -C "$directory" fetch --depth 1 "$remote" "$revision"
+            git -C "$directory" checkout --detach FETCH_HEAD
+            test "$(git -C "$directory" rev-parse HEAD)" = "$revision"
+          }
+          fetch_revision dxb https://github.com/blacktop/darwin-xnu-build.git 663906528d1cd5ea8fde7de6f16de73db9511549
+          fetch_revision sweet https://github.com/dipa-studio/ios-sweet.git 45263bee51df4a0f55cdf9c649af886399488ddb
+
+          python3 - <<'PY'
+          from hashlib import sha256
+          from pathlib import Path
+
+          upstream = Path("sweet/xnu/patches")
+          destination = Path("dxb/patches")
+          early = "0010-sweet-early-framebuffer-debug.patch"
+          expected = {
+              early: "892cbb941db7e19707d86e3ee30f1bfb2f35aa2d420ba24b5ae1d0058bdeae76",
+          }
+          for number in range(1, 12):
+              patch, = upstream.glob(f"{number:04d}-*.patch")
+              text = patch.read_text(encoding="utf-8")
+              if patch.name in expected:
+                  text = text.replace("(uintptr_t)0x9c000000", "(uintptr_t)0x9d400000")
+                  text = text.replace("#define EARLY_HEIGHT 2400u", "#define EARLY_HEIGHT 2160u")
+                  text = text.replace("Redmi Note 10 Pro bootstrap console", "ASUS X00TD bootstrap console")
+              if patch.name == early:
+                  text = text.replace("0x9c000000 + 2368 * 4320", "0x9d400000 + 2128 * 4320")
+                  text = text.replace("Splash framebuffer: one 32MB Normal-NC block in the EXISTING V=P",
+                                      "ASUS splash at 0x9d400000 inside the 0x9c000000 V=P")
+              data = text.encode("utf-8")
+              if patch.name in expected and sha256(data).hexdigest() != expected[patch.name]:
+                  raise SystemExit(f"Unexpected content for {patch.name}")
+              (destination / patch.name).write_bytes(data)
+          PY
+
+          cat > dxb/patches/0012-x00td-4k-bootstrap.patch <<'PATCH'
+          diff --git a/osfmk/arm64/start.s b/osfmk/arm64/start.s
+          --- a/osfmk/arm64/start.s
+          +++ b/osfmk/arm64/start.s
+          @@ -629,20 +629,44 @@
+           	create_bootstrap_mapping x14, x15, x5, x3, x2, x9, x10, x11, x12, x13
+           
+           #if defined(SWEET)
+          -	/*
+          -	 * ASUS splash at 0x9d400000 inside the 0x9c000000 V=P
+          -	 * L2 table. Both framebuffer and RAM use L1 index 0; another call to
+          -	 * create_bootstrap_mapping would replace the RAM L2 table.
+          -	 * SWEET uses 16K pages and all bring-up RAM is below 4GB, so the first
+          -	 * V=P L2 page is bootstrap_pagetables + 2*PGBYTES.
+          -	 */
+          -	MOV64	x10, 0x9c000000
+          +	/* Map the 1080x2160 splash with five 2 MiB identity blocks.
+          +	 * A 4 KiB L1 table covers 1 GiB per entry, so RAM and the splash
+          +	 * can use different L2 tables.
+          +	 */
+          +	MOV64	x10, 0x9d400000
+          +	and	x12, x10, #(ARM_TT_L1_INDEX_MASK)
+          +	lsr	x12, x12, #(ARM_TT_L1_SHIFT)
+          +	ldr	x13, [x1, x12, lsl #TTE_SHIFT]
+          +	tst	x13, #(ARM_TTE_VALID)
+          +	b.ne	Lx00td_fb_existing_l2
+          +
+          +	adrp	x13, EXT(x00td_framebuffer_l2)@page
+          +	add	x13, x13, EXT(x00td_framebuffer_l2)@pageoff
+          +	mov	x16, x13
+          +	mov	x17, #(TTE_PGENTRIES)
+          +Lx00td_fb_clear_l2:
+          +	str	xzr, [x16], #8
+          +	subs	x17, x17, #1
+          +	b.ne	Lx00td_fb_clear_l2
+          +	create_l1_table_entry x10, x1, x13, x11, x16, x17
+          +	b	Lx00td_fb_map_blocks
+          +
+          +Lx00td_fb_existing_l2:
+          +	and	x13, x13, #(ARM_TTE_TABLE_MASK)
+          +
+          +Lx00td_fb_map_blocks:
+          +	and	x12, x10, #(ARM_TT_L2_INDEX_MASK)
+          +	lsr	x12, x12, #(ARM_TT_L2_SHIFT)
+          +	add	x13, x13, x12, lsl #TTE_SHIFT
+           	MOV64	x11, (ARM_TTE_TYPE_BLOCK | ARM_TTE_VALID | ARM_TTE_BLOCK_SH(SH_OUTER_MEMORY) | ARM_TTE_BLOCK_ATTRINDX(CACHE_ATTRINDX_WRITECOMB) | ARM_TTE_BLOCK_AF | ARM_TTE_BLOCK_PNX | ARM_TTE_BLOCK_NX)
+          -	orr		x11, x11, x10
+          -	and		x12, x10, #(ARM_TT_L2_INDEX_MASK)
+          -	lsr		x12, x12, #(ARM_TT_L2_SHIFT)
+          -	add		x13, x25, #(2 * PGBYTES)
+          -	str		x11, [x13, x12, lsl #TTE_SHIFT]
+          +	orr	x11, x11, x10
+          +	mov	x16, #5
+          +	mov	x17, #(ARM_TT_L2_SIZE)
+          +Lx00td_fb_map_next:
+          +	str	x11, [x13], #8
+          +	add	x11, x11, x17
+          +	subs	x16, x16, #1
+          +	b.ne	Lx00td_fb_map_next
+           #endif
+           
+           	/* Ensure TTEs are visible */
+          diff --git a/osfmk/arm64/sweet_early.c b/osfmk/arm64/sweet_early.c
+          --- a/osfmk/arm64/sweet_early.c
+          +++ b/osfmk/arm64/sweet_early.c
+          @@ -23,6 +23,9 @@
+           #define EARLY_COLS (EARLY_WIDTH / EARLY_CELL_W)
+           
+           extern unsigned char iso_font[256 * 16];
+          +
+          +/* Temporary identity map, used only until arm_vm_init replaces TTBR0. */
+          +uint64_t x00td_framebuffer_l2[512] __attribute__((aligned(4096)));
+           
+           /* Initialized data must remain writable until disable, including panics. */
+           static unsigned int early_row, early_col;
+          diff --git a/pexpert/pexpert/arm64/SWEET.h b/pexpert/pexpert/arm64/SWEET.h
+          --- a/pexpert/pexpert/arm64/SWEET.h
+          +++ b/pexpert/pexpert/arm64/SWEET.h
+          @@ -3,7 +3,7 @@
+            * Snapdragon 732G): Kryo 470 = Cortex-A76 + Cortex-A55, ARMv8.2, no PAC.
+            *
+            * Generic ARM like BCM2837 (no APPLE_ARM64_ARCH_FAMILY: none of Apple's
+          - * implementation-defined system registers exist), 16K pages and GICv3 like
+          + * implementation-defined system registers exist), with X00TD 4 KiB pages and GICv3 like
+            * VMAPPLE. Unlike VMAPPLE the GIC has two security states (GICD_TYPER
+            * SecurityExtn=1): Group 0 belongs to TrustZone, so every interrupt,
+            * including the timer, is a Group 1 IRQ taken through sleh_irq().
+          @@ -26,7 +26,6 @@
+           #define __ARM_ENABLE_SWAP__       1
+           #define __ARM_V8_CRYPTO_EXTENSIONS__ 1
+           #define __ARM_PAN_AVAILABLE__     1
+          -#define __ARM_16K_PG__            1
+           
+           #define HAS_GIC_V3                1
+           
+          PATCH
+          printf '%s\n' 'ceb5959373012652c0da88dd46b4a05cee34d97e5feb7c002ca4f7e3149ab36b  dxb/patches/0012-x00td-4k-bootstrap.patch' | shasum -a 256 -c -
+
+          cat > dxb/patches/0013-x00td-4k-address-layout.patch <<'PATCH'
+          diff --git a/makedefs/MakeInc.def b/makedefs/MakeInc.def
+          --- a/makedefs/MakeInc.def
+          +++ b/makedefs/MakeInc.def
+          @@ -330,11 +330,13 @@
+           ARM64_PLKSEG_ADDR  =0xfffffff004004000
+           ARM64_LINK_ADDR    =0xfffffff007004000
+           
+          -# Use ARM_LARGE_MEMORY config for all MacOSX targets.
+          +# X00TD uses XNU's compact kernel layout for 4 KiB translation tables.
+          +ifneq ($(CURRENT_MACHINE_CONFIG),SWEET)
+           ifneq ($(filter $(PLATFORM),MacOSX),)
+           LARGE_MEMORY_DEFINE=-DARM_LARGE_MEMORY=1
+           ARM64_PLKSEG_ADDR  =0xfffffe0004004000
+           ARM64_LINK_ADDR    =0xfffffe0007004000
+          +endif
+           endif
+           
+           
+          diff --git a/osfmk/mach/arm/vm_param.h b/osfmk/mach/arm/vm_param.h
+          --- a/osfmk/mach/arm/vm_param.h
+          +++ b/osfmk/mach/arm/vm_param.h
+          @@ -133,7 +133,8 @@
+           
+           /* system-wide values */
+           #define MACH_VM_MIN_ADDRESS_RAW 0x0ULL
+          -#if defined(XNU_PLATFORM_MacOSX) || defined(XNU_PLATFORM_DriverKit)
+          +/* X00TD uses the existing 4 KiB ARM64 commpage nesting range. */
+          +#if (defined(XNU_PLATFORM_MacOSX) || defined(XNU_PLATFORM_DriverKit)) && !defined(ARM64_BOARD_CONFIG_SWEET)
+           #define MACH_VM_MAX_ADDRESS_RAW 0x00007FFFFE000000ULL
+           #else
+           #define MACH_VM_MAX_ADDRESS_RAW 0x0000000FC0000000ULL
+          PATCH
+          printf '%s\n' 'ea5ba746cc2efc6fbd1d9f9225df3ae307018fd6e3c2a26fb14c235b8425db13  dxb/patches/0013-x00td-4k-address-layout.patch' | shasum -a 256 -c -
+
+          cat > dxb/patches/0014-x00td-armv8-baseline.patch <<'PATCH'
+          diff --git a/makedefs/MakeInc.def b/makedefs/MakeInc.def
+          --- a/makedefs/MakeInc.def
+          +++ b/makedefs/MakeInc.def
+          @@ -61,7 +61,7 @@
+           MACHINE_FLAGS_ARM64_T6000 = -DARM64_BOARD_CONFIG_T6000 		-mcpu=apple-a14
+           MACHINE_FLAGS_ARM64_VMAPPLE = -DARM64_BOARD_CONFIG_VMAPPLE              -march=armv8.5a
+           MACHINE_FLAGS_ARM64_BCM2837 = -DARM64_BOARD_CONFIG_BCM2837
+          -MACHINE_FLAGS_ARM64_SWEET = -DARM64_BOARD_CONFIG_SWEET                -march=armv8.2-a+crypto
+          +MACHINE_FLAGS_ARM64_SWEET = -DARM64_BOARD_CONFIG_SWEET                -march=armv8-a+crypto
+           
+           
+           #
+          PATCH
+          printf '%s\n' '2180f5be255000b6f96118a82b6d1554d77542be394080b5a0e2c474aa993f2f  dxb/patches/0014-x00td-armv8-baseline.patch' | shasum -a 256 -c -
+
+          cat > dxb/patches/0015-x00td-disable-lse-codegen.patch <<'PATCH'
+          diff --git a/makedefs/MakeInc.def b/makedefs/MakeInc.def
+          --- a/makedefs/MakeInc.def
+          +++ b/makedefs/MakeInc.def
+          @@ -340,6 +340,12 @@
+           
+           CFLAGS_ARM64	= -Darm64 -DARM64 -D__ARM64__ -DLP64 -DPAGE_SIZE_FIXED -DVM_KERNEL_LINK_ADDRESS=$(ARM64_LINK_ADDR) \
+           			$(LARGE_MEMORY_DEFINE) -momit-leaf-frame-pointer -fno-strict-aliasing -D__API__=v4 -mkernel
+          +
+          +# Keep this Qualcomm port on baseline ARMv8-A even when the Apple driver
+          +# selects CPU defaults from the SDK or deployment target.
+          +ifeq ($(CURRENT_MACHINE_CONFIG),SWEET)
+          +CFLAGS_ARM64 += -mcpu=cortex-a53 -mno-outline-atomics -Xclang -target-feature -Xclang -lse
+          +endif
+           
+           CFLAGS_RELEASEX86_64 = -O2
+           CFLAGS_DEVELOPMENTX86_64 = -O2
+          PATCH
+          printf '%s\n' '3566f41bb64a96d583472fdadb763c10ae9a59f32701b9e1d6969bb9901c09ca  dxb/patches/0015-x00td-disable-lse-codegen.patch' | shasum -a 256 -c -
+
+          cat > dxb/patches/0016-x00td-baseline-pan-config.patch <<'PATCH'
+          diff --git a/pexpert/pexpert/arm64/SWEET.h b/pexpert/pexpert/arm64/SWEET.h
+          --- a/pexpert/pexpert/arm64/SWEET.h
+          +++ b/pexpert/pexpert/arm64/SWEET.h
+          @@ -25,7 +25,8 @@
+           #define __ARM_DEBUG__             7
+           #define __ARM_ENABLE_SWAP__       1
+           #define __ARM_V8_CRYPTO_EXTENSIONS__ 1
+          -#define __ARM_PAN_AVAILABLE__     1
+          +/* Baseline ARMv8-A configuration uses XNU's paths without hardware PAN. */
+          +#define __ARM_PAN_AVAILABLE__     0
+           
+           #define HAS_GIC_V3                1
+           
+          PATCH
+          printf '%s\n' '24291e5f94b447f160284ef8368cfc71c9e15c35b0af695cb6142182ac173dd1  dxb/patches/0016-x00td-baseline-pan-config.patch' | shasum -a 256 -c -
+
+          cat > dxb/patches/0017-x00td-commpage-baseline-atomics.patch <<'PATCH'
+          diff --git a/osfmk/arm/commpage/commpage_asm.s b/osfmk/arm/commpage/commpage_asm.s
+          --- a/osfmk/arm/commpage/commpage_asm.s
+          +++ b/osfmk/arm/commpage/commpage_asm.s
+          @@ -273,7 +273,18 @@
+           	mov		w11, #1			 // locked value = w11 = 1
+           
+           	// Try to grab the lock
+          +#if defined(ARM64_BOARD_CONFIG_SWEET)
+          +	/* One try, with only forward branches inside the preemption-free zone. */
+          +	ldaxr	w10, [x3]
+          +	cbnz	w10, Lx00td_enqueue_lock_held
+          +	stxr	w10, w11, [x3]
+          +	b	Lx00td_enqueue_lock_result
+          +Lx00td_enqueue_lock_held:
+          +	clrex
+          +Lx00td_enqueue_lock_result:
+          +#else
+           	casa	w10, w11, [x3]	 // Atomic CAS with acquire barrier
+          +#endif
+           	cbz		w10, Ltrylock_enqueue_success
+           
+           	mov		x0, #-1			// Failed
+          @@ -323,7 +334,18 @@
+           	mov		w10, wzr		 // unlock value = w10 = 0
+           	mov		w11, #1			 // locked value = w11 = 1
+           
+          +#if defined(ARM64_BOARD_CONFIG_SWEET)
+          +	/* One try, with only forward branches inside the preemption-free zone. */
+          +	ldaxr	w10, [x2]
+          +	cbnz	w10, Lx00td_dequeue_lock_held
+          +	stxr	w10, w11, [x2]
+          +	b	Lx00td_dequeue_lock_result
+          +Lx00td_dequeue_lock_held:
+          +	clrex
+          +Lx00td_dequeue_lock_result:
+          +#else
+           	casa	w10, w11, [x2]	 // Atomic CAS with acquire barrier
+          +#endif
+           	cbz		w10, Ltrylock_dequeue_success
+           
+           	mov		x0, #-1			// Failed
+          PATCH
+          printf '%s\n' 'b7feb541f42a21b9c384473f4b50ce8aba852929a8e328fa19e0e5e657cfe6fb  dxb/patches/0017-x00td-commpage-baseline-atomics.patch' | shasum -a 256 -c -
+
+          cat > dxb/patches/0018-x00td-4k-persistent-console.patch <<'PATCH'
+          diff --git a/osfmk/arm64/arm_vm_init.c b/osfmk/arm64/arm_vm_init.c
+          --- a/osfmk/arm64/arm_vm_init.c
+          +++ b/osfmk/arm64/arm_vm_init.c
+          @@ -1825,6 +1825,42 @@
+           #define ARM64_PHYSMAP_ALIGNMENT_PADDING (PTOV_TABLE_SIZE * ARM_TT_TWIG_SIZE)
+           #endif
+           
+          +#if defined(SWEET)
+          +/* Reserve an unused kernel VA below the bootstrap aperture for diagnostics. */
+          +#define SWEET_EARLY_FB_VA (gVirtBase - ARM_TT_L1_SIZE)
+          +#define X00TD_FB_BLOCKS 5u
+          +
+          +static void
+          +sweet_early_map_final(void)
+          +{
+          +	const vm_map_address_t va = SWEET_EARLY_FB_VA;
+          +	assert((va & ARM_TT_L2_OFFMASK) == 0);
+          +	assert(va >= VM_MIN_KERNEL_ADDRESS + 2 * ARM_TT_L2_SIZE);
+          +	assert(va + X00TD_FB_BLOCKS * ARM_TT_L2_SIZE <= gVirtBase);
+          +	tt_entry_t *l1_slot = &cpu_tte[(va & ARM_TT_L1_INDEX_MASK) >> ARM_TT_L1_SHIFT];
+          +	if (*l1_slot == ARM_TTE_EMPTY) {
+          +		vm_offset_t page = alloc_ptpage(TRUE);
+          +		bzero((void *)page, ARM_PGBYTES);
+          +		*l1_slot = (kvtophys(page) & ARM_TTE_TABLE_MASK) | ARM_TTE_VALID |
+          +		    ARM_TTE_TYPE_TABLE | ARM_TTE_TABLE_AP(ARM_TTE_TABLE_AP_USER_NA);
+          +	}
+          +	assert((*l1_slot & (ARM_TTE_VALID | ARM_TTE_TYPE_MASK)) ==
+          +	    (ARM_TTE_VALID | ARM_TTE_TYPE_TABLE));
+          +	tt_entry_t *l2 = (tt_entry_t *)phystokv(*l1_slot & ARM_TTE_TABLE_MASK);
+          +	unsigned first = (va & ARM_TT_L2_INDEX_MASK) >> ARM_TT_L2_SHIFT;
+          +	assert(first + X00TD_FB_BLOCKS <= TTE_PGENTRIES);
+          +	for (unsigned i = 0; i < X00TD_FB_BLOCKS; ++i) {
+          +		assert(l2[first + i] == ARM_TTE_EMPTY);
+          +		l2[first + i] = (0x9d400000ULL + i * ARM_TT_L2_SIZE) |
+          +		    ARM_TTE_VALID | ARM_TTE_TYPE_BLOCK |
+          +		    ARM_TTE_BLOCK_SH(SH_OUTER_MEMORY) |
+          +		    ARM_TTE_BLOCK_ATTRINDX(CACHE_ATTRINDX_WRITECOMB) |
+          +		    ARM_TTE_BLOCK_AF | ARM_TTE_BLOCK_PNX | ARM_TTE_BLOCK_NX;
+          +	}
+          +	__asm__ volatile("dsb ishst" ::: "memory");
+          +}
+          +#endif
+          +
+           void
+           arm_vm_init(uint64_t memory_size, boot_args * args)
+           {
+          @@ -2153,20 +2189,28 @@
+           
+           	arm_set_user_tbi();
+           
+          +#if defined(SWEET)
+          +	/* phystokv() must still refer to the bootstrap aperture here. */
+          +	sweet_early_map_final();
+          +#endif
+           	arm_vm_physmap_init(args);
+           	set_mmu_ttb_alternate(cpu_ttep & TTBR_BADDR_MASK);
+           
+           	ml_enable_monitor();
+           
+          -	/* The framebuffer VA=PA mapping belongs to the outgoing TTBR0. */
+          -	sweet_early_disable();
+          +#if defined(SWEET)
+          +	/* The final TTBR1 is live; leave the outgoing VA=PA framebuffer alias. */
+          +	sweet_early_relocate(SWEET_EARLY_FB_VA);
+          +#endif
+           	set_mmu_ttb(invalid_ttep & TTBR_BADDR_MASK);
+           
+           	flush_mmu_tlb();
+          +	sweet_early_mark(10, "TTBR0 off; TLB flushed");
+           	kva_active = TRUE;
+           	// global table pointers may need to be different due to physical aperture remapping
+           	cpu_tte = (tt_entry_t*)(phystokv(cpu_ttep));
+           	invalid_tte = (tt_entry_t*)(phystokv(invalid_ttep));
+          +	sweet_early_mark(11, "physmap table pointers rebound");
+           
+           	// From here on out, we're off the bootstrap translation tables.
+           
+          @@ -2259,7 +2303,9 @@
+               }
+           #endif
+           #endif
+          +	sweet_early_mark(12, "calling pmap_bootstrap");
+           	pmap_bootstrap(dynamic_memory_begin);
+          +	sweet_early_mark(13, "pmap_bootstrap done");
+           
+           	disable_preemption();
+           
+          @@ -2310,6 +2356,7 @@
+           		va_l1 = va_l2_end;
+           		cpu_l1_tte++;
+           	}
+          +	sweet_early_mark(14, "early I/O page tables ready");
+           
+           #if defined(KERNEL_INTEGRITY_KTRR) || defined(KERNEL_INTEGRITY_CTRR)
+           	/*
+          diff --git a/osfmk/arm64/sweet_early.c b/osfmk/arm64/sweet_early.c
+          --- a/osfmk/arm64/sweet_early.c
+          +++ b/osfmk/arm64/sweet_early.c
+          @@ -2,7 +2,8 @@
+            * ASUS X00TD bootstrap console. No allocation, locks, ADT parsing or
+            * per-CPU state: panic() can reach this before a current thread exists.
+            * start.s maps the splash framebuffer VA=PA as Normal Non-Cacheable memory.
+          - * Stop using that mapping before arm_vm_init tears down bootstrap TTBR0.
+          + * arm_vm_init installs a reserved kernel VA alias before removing TTBR0;
+          + * retain this console until the normal framebuffer serial console is ready.
+            */
+           #include <arm64/sweet_early.h>
+           
+          @@ -10,7 +11,8 @@
+           #include <stdint.h>
+           #include <kern/misc_protos.h>
+           
+          -#define EARLY_FB ((volatile uint32_t *)(uintptr_t)0x9d400000)
+          +static volatile uint32_t *early_fb = (volatile uint32_t *)(uintptr_t)0x9d400000;
+          +#define EARLY_FB early_fb
+           #define EARLY_WIDTH 1080u
+           #define EARLY_HEIGHT 2160u
+           #define EARLY_STRIDE (4320u / 4)
+          @@ -90,18 +92,21 @@
+           void
+           sweet_early_mark(unsigned int stage, const char *label)
+           {
+          -	if (early_disabled || stage > 8) {
+          +	if (early_disabled || stage > 22) {
+           		return;
+           	}
+          -	uint32_t color = 0xff00ff00u | (stage * 28u << 16);
+          +	uint32_t color = 0xff00ff00u | ((stage & 7u) * 32u << 16);
+           	for (unsigned int y = EARLY_HEIGHT - 32; y < EARLY_HEIGHT; y++) {
+          -		for (unsigned int x = stage * 64; x < (stage + 1) * 64; x++) {
+          +		for (unsigned int x = stage * 48; x < (stage + 1) * 48 && x < EARLY_WIDTH; x++) {
+           			EARLY_FB[y * EARLY_STRIDE + x] = color;
+           		}
+           	}
+           	__asm__ volatile("dsb sy" ::: "memory");
+           	sweet_early_string("SWEET EARLY ");
+          -	sweet_early_putc((char)('0' + stage));
+          +	if (stage >= 10) {
+          +		sweet_early_putc((char)('0' + stage / 10));
+          +	}
+          +	sweet_early_putc((char)('0' + stage % 10));
+           	sweet_early_string(": ");
+           	sweet_early_string(label);
+           	sweet_early_putc('\n');
+          @@ -124,9 +129,17 @@
+           }
+           
+           void
+          +sweet_early_relocate(uint64_t base)
+          +{
+          +	sweet_early_mark(8, "leaving bootstrap TTBR0");
+          +	early_fb = (volatile uint32_t *)(uintptr_t)base;
+          +	__asm__ volatile("dsb sy" ::: "memory");
+          +	sweet_early_mark(9, "kernel framebuffer VA live");
+          +}
+          +
+          +void
+           sweet_early_disable(void)
+           {
+          -	sweet_early_mark(8, "leaving bootstrap TTBR0");
+           	early_disabled = 1;
+           	__asm__ volatile("dsb sy" ::: "memory");
+           }
+          diff --git a/osfmk/arm64/sweet_early.h b/osfmk/arm64/sweet_early.h
+          --- a/osfmk/arm64/sweet_early.h
+          +++ b/osfmk/arm64/sweet_early.h
+          @@ -1,14 +1,16 @@
+          -/* Early screen diagnostics, valid only while the bootstrap TTBR0 is live. */
+          +/* Screen diagnostics through bootstrap TTBR0 and the final kernel TTBR1. */
+           #ifndef _ARM64_SWEET_EARLY_H_
+           #define _ARM64_SWEET_EARLY_H_
+           
+           #include <pexpert/arm64/board_config.h>
+           #include <stdarg.h>
+          +#include <stdint.h>
+           
+           #if defined(SWEET)
+           void sweet_early_mark(unsigned int stage, const char *label);
+           void sweet_early_putc(char c);
+           void sweet_early_panic(const char *fmt, va_list *args);
+          +void sweet_early_relocate(uint64_t base);
+           void sweet_early_disable(void);
+           #else
+           static inline void sweet_early_mark(unsigned int stage, const char *label)
+          diff --git a/osfmk/arm64/Makefile b/osfmk/arm64/Makefile
+          --- a/osfmk/arm64/Makefile
+          +++ b/osfmk/arm64/Makefile
+          @@ -40,6 +40,7 @@
+           	monotonic.h \
+           	perfmon_arm64_regs.h \
+           	proc_reg.h \
+          +	sweet_early.h \
+           	asm.h \
+           	tlb.h \
+           	pal_hibernate.h
+          diff --git a/osfmk/arm/arm_init.c b/osfmk/arm/arm_init.c
+          --- a/osfmk/arm/arm_init.c
+          +++ b/osfmk/arm/arm_init.c
+          @@ -523,6 +523,7 @@
+           
+           	sweet_early_mark(7, "entering arm_vm_init");
+           	arm_vm_init(xmaxmem, args);
+          +	sweet_early_mark(15, "arm_vm_init returned");
+           
+           	if (debug_boot_arg) {
+           		patch_low_glo();
+          @@ -535,9 +536,13 @@
+           	PE_consistent_debug_inherit();
+           
+           	/* Setup debugging output. */
+          +	sweet_early_mark(16, "calling serial_init");
+           	const unsigned int serial_exists = serial_init();
+          +	sweet_early_mark(19, "serial_init returned");
+           	kernel_startup_initialize_upto(STARTUP_SUB_KPRINTF);
+           	kprintf("kprintf initialized\n");
+          +	sweet_early_mark(20, "kprintf startup complete");
+          +	/* Keep the early panic console active throughout this diagnostic build. */
+           
+           	serialmode = 0;
+           	if (PE_parse_boot_argn("serial", &serialmode, sizeof(serialmode))) {
+          diff --git a/pexpert/arm/pe_serial.c b/pexpert/arm/pe_serial.c
+          --- a/pexpert/arm/pe_serial.c
+          +++ b/pexpert/arm/pe_serial.c
+          @@ -26,6 +26,7 @@
+           #include <pexpert/arm/consistent_debug.h>
+           #include <pexpert/arm64/board_config.h>
+           #include <arm64/proc_reg.h>
+          +#include <arm64/sweet_early.h>
+           #include <pexpert/arm/protos.h>
+           #include <kern/sched_prim.h>
+           #if HIBERNATION
+          @@ -833,7 +834,9 @@
+           	if (!fbcon_width || !fbcon_height || fbcon_stride < fbcon_width * 4) {
+           		return;
+           	}
+          +	sweet_early_mark(17, "fbcon config read; mapping");
+           	fbcon_base = (volatile uint32_t *)ml_io_map_wcomb(reg[0], reg[1]);
+          +	sweet_early_mark(18, "fbcon mapping returned");
+           	if (fbcon_base != NULL) {
+           		register_serial_functions(&sweet_fbcon_serial_functions);
+           	}
+          diff --git a/pexpert/arm/pe_fiq.c b/pexpert/arm/pe_fiq.c
+          --- a/pexpert/arm/pe_fiq.c
+          +++ b/pexpert/arm/pe_fiq.c
+          @@ -3,6 +3,7 @@
+            */
+           
+           #include <stdint.h>
+          +#include <arm64/sweet_early.h>
+           #include <arm64/proc_reg.h>
+           #include <kern/clock.h>
+           #include <mach/mach_time.h>
+          @@ -121,7 +122,9 @@
+           	}
+           
+           	// Find the redistributor for this processor
+          +	sweet_early_mark(21, "locating GIC redistributor");
+           	vm_offset_t gicr_pe_base = find_gicr_pe_base();
+          +	sweet_early_mark(22, "GIC redistributor found");
+           
+           	// Mark this PE to be awake
+           	uint32_t gicr_waker = gicr_read32(GICR_WAKER);
+          PATCH
+          printf '%s\n' '1af4d728d8a06d94f9b0460f3d34a9aec4ced6db770f8caaaebf6fd52eda856d  dxb/patches/0018-x00td-4k-persistent-console.patch' | shasum -a 256 -c -
+
+          # Keep the zone reservation within X00TD's compact kernel VA layout.
+          cat > dxb/patches/0019-x00td-compact-zone-map.patch <<'PATCH'
+          diff --git a/osfmk/kern/zalloc.c b/osfmk/kern/zalloc.c
+          --- a/osfmk/kern/zalloc.c
+          +++ b/osfmk/kern/zalloc.c
+          @@ -160,7 +160,7 @@
+           #define ZONE_GUARD_SPARSE       (64  * 1024)
+           #endif /* ZSECURITY_CONFIG(SAD_FENG_SHUI) */
+           
+          -#if XNU_PLATFORM_MacOSX
+          +#if XNU_PLATFORM_MacOSX && !defined(ARM64_BOARD_CONFIG_SWEET)
+           #define ZONE_MAP_MAX            (32ULL << 30)
+           #define ZONE_MAP_VA_SIZE        (128ULL << 30)
+           #else /* XNU_PLATFORM_MacOSX */
+          PATCH
+          printf '%s\n' '22785d739016f6cf6a15956c794c4ee0229bf950b1a5a152468c380de4341bf1  dxb/patches/0019-x00td-compact-zone-map.patch' | shasum -a 256 -c -
+
+          cat > dxb/patches/0020-x00td-zone-map-diagnostics.patch <<'PATCH'
+          diff --git a/osfmk/vm/vm_kern.c b/osfmk/vm/vm_kern.c
+          --- a/osfmk/vm/vm_kern.c
+          +++ b/osfmk/vm/vm_kern.c
+          @@ -3493,6 +3493,17 @@
+           		total_claims += kmem_claims[i].kc_size;
+           	}
+           	assert((total_claims & PAGE_MASK) == 0);
+          +#if defined(ARM64_BOARD_CONFIG_SWEET)
+          +	if (total_claims > largest_free_size) {
+          +		panic("X00TD ZMAP v17: claims exceed largest hole\n"
+          +		    "claims=0x%llx largest=0x%llx\n"
+          +		    "map=0x%llx..0x%llx",
+          +		    (unsigned long long)total_claims,
+          +		    (unsigned long long)largest_free_size,
+          +		    (unsigned long long)kernel_map->min_offset,
+          +		    (unsigned long long)kernel_map->max_offset);
+          +	}
+          +#endif
+           	largest_free_size -= total_claims;
+           
+           	/*
+          @@ -3592,8 +3603,23 @@
+           		struct mach_vm_range *sp_range = sp.kc_range;
+           		if (vm_map_locate_space(kernel_map, sp.kc_size, 0,
+           		    VM_MAP_KERNEL_FLAGS_ANYWHERE(), &start, NULL) != KERN_SUCCESS) {
+          +#if defined(ARM64_BOARD_CONFIG_SWEET)
+          +			vm_map_size_t largest = 0;
+          +			vm_map_sizes(kernel_map, NULL, NULL, &largest);
+          +			panic("X00TD ZMAP v17: claim %s (%u/%u)\n"
+          +			    "request=0x%llx start=0x%llx\n"
+          +			    "map=0x%llx..0x%llx\n"
+          +			    "largest=0x%llx",
+          +			    sp.kc_name, (unsigned)i, (unsigned)kmem_claim_count,
+          +			    (unsigned long long)sp.kc_size,
+          +			    (unsigned long long)start,
+          +			    (unsigned long long)kernel_map->min_offset,
+          +			    (unsigned long long)kernel_map->max_offset,
+          +			    (unsigned long long)largest);
+          +#else
+           			panic("kmem_range_init: vm_map_locate_space failing for claim %s",
+           			    sp.kc_name);
+          +#endif
+           		}
+           
+           		end = start + sp.kc_size;
+          PATCH
+          printf '%s\n' '0682eb12b2af732201557a973a6c9a98844adb129e5f90b2a67ce3566c575e02  dxb/patches/0020-x00td-zone-map-diagnostics.patch' | shasum -a 256 -c -
+
+          cat > dxb/patches/0021-sweet-kmem-rng-without-corecrypto.patch <<'PATCH'
+          diff --git a/osfmk/vm/vm_kern.c b/osfmk/vm/vm_kern.c
+          --- a/osfmk/vm/vm_kern.c
+          +++ b/osfmk/vm/vm_kern.c
+          @@ -2439,22 +2439,68 @@
+           	}
+           }
+           
+          +#if defined(SWEET)
+          +/*
+          + * No corecrypto kext is loaded on SWEET yet. The kmem RNG contract permits
+          + * a non-cryptographic generator and requires lock-free generation. Keep
+          + * allocator RNG state per CPU/sizeclass; seed it from XNU's built-in early
+          + * HMAC-SHA256 DRBG during single-CPU initialization.
+          + *
+          + * SplitMix64: Sebastiano Vigna, 2015, public-domain reference:
+          + * https://prng.di.unimi.it/splitmix64.c
+          + * This is private to kmem; it does not register or replace crypto services.
+          + */
+          +struct sweet_kmem_rng {
+          +	uint64_t state;
+          +};
+          +
+          +static uint64_t
+          +sweet_kmem_random64(struct sweet_kmem_rng *rng)
+          +{
+          +	uint64_t value = (rng->state += 0x9e3779b97f4a7c15ULL);
+          +	value = (value ^ (value >> 30)) * 0xbf58476d1ce4e5b9ULL;
+          +	value = (value ^ (value >> 27)) * 0x94d049bb133111ebULL;
+          +	return value ^ (value >> 31);
+          +}
+          +
+          +static uint64_t
+          +sweet_kmem_uniform(struct sweet_kmem_rng *rng, uint64_t bound)
+          +{
+          +	assert(bound != 0);
+          +	/* Reject the incomplete residue interval to avoid modulo bias. */
+          +	const uint64_t threshold = -bound % bound;
+          +	uint64_t value;
+          +	do {
+          +		value = sweet_kmem_random64(rng);
+          +	} while (value < threshold);
+          +	return value % bound;
+          +}
+          +#endif /* SWEET */
+          +
+           /*
+            * This is done during EARLY_BOOT as it needs the corecrypto module to be
+          - * set up.
+          + * set up on platforms that use it for allocator randomness.
+            */
+           __startup_func
+           static void
+           kmem_crypto_init(void)
+           {
+          +#if defined(SWEET)
+          +	vm_size_t ctx_size = sizeof(struct sweet_kmem_rng);
+          +#else
+           	vm_size_t ctx_size = crypto_random_kmem_ctx_size();
+          +#endif
+           
+           	for (uint32_t i = 0; i < KMEM_NUM_SIZECLASS; i++) {
+           		struct kmem_sizeclass *ks = &kmem_size_array[i];
+           
+           		ks->ks_rng_ctx = zalloc_percpu_permanent(ctx_size, ZALIGN_PTR);
+           		zpercpu_foreach(ctx, ks->ks_rng_ctx) {
+          +#if defined(SWEET)
+          +			((struct sweet_kmem_rng *)ctx)->state = early_random();
+          +#else
+           			crypto_random_kmem_init(ctx);
+          +#endif
+           		}
+           	}
+           }
+          @@ -2711,17 +2757,20 @@
+           	assert(num_slots > 0);
+           	if (__improbable(startup_phase < STARTUP_SUB_EARLY_BOOT)) {
+           		/*
+          -		 * Use early random prior to early boot as the ks_rng_ctx requires
+          -		 * the corecrypto module to be setup before it is initialized and
+          -		 * used.
+          +		 * Use early random before the per-CPU allocator generators have
+          +		 * been initialized during EARLY_BOOT.
+           		 *
+           		 * num_slots can't be 0 as we take this path when we have more than
+           		 * one slot left.
+           		 */
+           		slot_idx = kmem_get_random16((uint16_t)num_slots - 1);
+           	} else {
+          +#if defined(SWEET)
+          +		slot_idx = sweet_kmem_uniform(zpercpu_get(sizeclass.ks_rng_ctx), num_slots);
+          +#else
+           		crypto_random_uniform(zpercpu_get(sizeclass.ks_rng_ctx), num_slots,
+           		    &slot_idx);
+          +#endif
+           	}
+           
+           	return kmem_get_nth_free_slot(meta, slot_idx, bitmap);
+          PATCH
+          printf '%s\n' '12132c39435479e546d1ce4e24622d2ad145c8eb6274293b690ea5e1e58d9f91  dxb/patches/0021-sweet-kmem-rng-without-corecrypto.patch' | shasum -a 256 -c -
+
+          cat > dxb/patches/0022-sweet-kernel-hmac-prng.patch <<'PATCH'
+          diff --git a/osfmk/prng/prng_random.c b/osfmk/prng/prng_random.c
+          --- a/osfmk/prng/prng_random.c
+          +++ b/osfmk/prng/prng_random.c
+          @@ -145,6 +145,140 @@
+           		     .strictFIPS = 0,
+           	     }};
+           
+          +#if defined(SWEET)
+          +/*
+          + * The corecrypto kext normally installs the kernel PRNG. SWEET has no such
+          + * kext: use the built-in HMAC-SHA256 DRBG, just as early_random does. A
+          + * single mutex serializes generation and reseeding across all CPUs. This
+          + * favors a small, auditable bring-up implementation over per-CPU scaling.
+          + * This registers only the PRNG, not the unrelated g_crypto_funcs table.
+          + */
+          +#include <kern/startup.h>
+          +
+          +static LCK_GRP_DECLARE(sweet_prng_group, "sweet-prng");
+          +static LCK_MTX_DECLARE(sweet_prng_lock, &sweet_prng_group);
+          +static struct cckprng_ctx sweet_prng_ctx;
+          +static const struct ccdrbg_nisthmac_custom sweet_prng_custom = {
+          +	.di = &ccsha256_ltc_di,
+          +	.strictFIPS = 0,
+          +};
+          +static cckprng_getentropy sweet_getentropy;
+          +static void *sweet_getentropy_arg;
+          +static unsigned sweet_max_ngens;
+          +static bool sweet_generators[MAX_CPUS];
+          +
+          +static struct ccdrbg_state *
+          +sweet_prng_state(struct cckprng_ctx *ctx)
+          +{
+          +	return (struct ccdrbg_state *)ctx->drbg_state;
+          +}
+          +
+          +static void
+          +sweet_prng_check(int status)
+          +{
+          +	if (status != CCDRBG_STATUS_OK) {
+          +		panic("SWEET HMAC DRBG error %d", status);
+          +	}
+          +}
+          +
+          +static void
+          +sweet_prng_init_with_getentropy(struct cckprng_ctx *ctx, unsigned max_ngens,
+          +    size_t seed_nbytes, const void *seed, size_t nonce_nbytes, const void *nonce,
+          +    cckprng_getentropy getentropy, void *getentropy_arg)
+          +{
+          +	assert(max_ngens > 0 && max_ngens <= MAX_CPUS);
+          +	ccdrbg_factory_nisthmac(&ctx->drbg_info, &sweet_prng_custom);
+          +	assert(ctx->drbg_info.size <= sizeof(ctx->drbg_state));
+          +	const char ps[] = "xnu sweet kernel random";
+          +	sweet_prng_check(ccdrbg_init(&ctx->drbg_info, sweet_prng_state(ctx),
+          +	    seed_nbytes, seed, nonce_nbytes, nonce, sizeof(ps) - 1, ps));
+          +	sweet_getentropy = getentropy;
+          +	sweet_getentropy_arg = getentropy_arg;
+          +	sweet_max_ngens = max_ngens;
+          +}
+          +
+          +static void
+          +sweet_prng_init(struct cckprng_ctx *ctx, size_t seed_nbytes, const void *seed,
+          +    size_t nonce_nbytes, const void *nonce, cckprng_getentropy getentropy,
+          +    void *getentropy_arg)
+          +{
+          +	sweet_prng_init_with_getentropy(ctx, MAX_CPUS, seed_nbytes, seed,
+          +	    nonce_nbytes, nonce, getentropy, getentropy_arg);
+          +}
+          +
+          +static void
+          +sweet_prng_initgen(__unused struct cckprng_ctx *ctx, unsigned gen_idx)
+          +{
+          +	lck_mtx_lock(&sweet_prng_lock);
+          +	assert(gen_idx < sweet_max_ngens);
+          +	assert(!sweet_generators[gen_idx]);
+          +	sweet_generators[gen_idx] = true;
+          +	lck_mtx_unlock(&sweet_prng_lock);
+          +}
+          +
+          +static void
+          +sweet_prng_reseed(struct cckprng_ctx *ctx, size_t nbytes, const void *seed)
+          +{
+          +	lck_mtx_lock(&sweet_prng_lock);
+          +	sweet_prng_check(ccdrbg_reseed(&ctx->drbg_info, sweet_prng_state(ctx),
+          +	    nbytes, seed, 0, NULL));
+          +	lck_mtx_unlock(&sweet_prng_lock);
+          +}
+          +
+          +static void
+          +sweet_prng_refresh(struct cckprng_ctx *ctx)
+          +{
+          +	/* The entropy callback also uses try-lock; refresh must not wait. */
+          +	if (!lck_mtx_try_lock(&sweet_prng_lock)) {
+          +		return;
+          +	}
+          +	uint8_t entropy[CCKPRNG_ENTROPY_SIZE];
+          +	size_t nbytes = sizeof(entropy);
+          +	int32_t nsamples = sweet_getentropy(&nbytes, entropy, sweet_getentropy_arg);
+          +	if (nsamples < 0) {
+          +		panic("SWEET PRNG entropy health test failed");
+          +	}
+          +	if (nsamples >= 256) {
+          +		assert(nbytes >= SEED_SIZE && nbytes <= sizeof(entropy));
+          +		sweet_prng_check(ccdrbg_reseed(&ctx->drbg_info, sweet_prng_state(ctx),
+          +		    nbytes, entropy, 0, NULL));
+          +	}
+          +	cc_clear(sizeof(entropy), entropy);
+          +	lck_mtx_unlock(&sweet_prng_lock);
+          +}
+          +
+          +static void
+          +sweet_prng_generate(struct cckprng_ctx *ctx, unsigned gen_idx,
+          +    size_t nbytes, void *out)
+          +{
+          +	assert(nbytes <= CCKPRNG_GENERATE_MAX_NBYTES);
+          +	lck_mtx_lock(&sweet_prng_lock);
+          +	assert(gen_idx < sweet_max_ngens && sweet_generators[gen_idx]);
+          +	sweet_prng_check(ccdrbg_generate(&ctx->drbg_info, sweet_prng_state(ctx),
+          +	    nbytes, out, 0, NULL));
+          +	lck_mtx_unlock(&sweet_prng_lock);
+          +}
+          +
+          +__startup_func
+          +static void
+          +sweet_prng_startup(void)
+          +{
+          +	/* Ensure the boot seed exists before registration erases the early DRBG. */
+          +	(void)early_random();
+          +	const struct cckprng_funcs funcs = {
+          +		.init = sweet_prng_init,
+          +		.initgen = sweet_prng_initgen,
+          +		.reseed = sweet_prng_reseed,
+          +		.refresh = sweet_prng_refresh,
+          +		.generate = sweet_prng_generate,
+          +		.init_with_getentropy = sweet_prng_init_with_getentropy,
+          +	};
+          +	register_and_init_prng(&sweet_prng_ctx, &funcs);
+          +	kprintf("SWEET PRNG: HMAC-SHA256 registered\n");
+          +}
+          +STARTUP(EARLY_BOOT, STARTUP_RANK_FIRST, sweet_prng_startup);
+          +#endif /* SWEET */
+          +
+           static void read_erandom(void * buf, size_t nbytes);
+           
+           /*
+          @@ -339,12 +473,22 @@
+           write_random(void * buffer, u_int numbytes)
+           {
+           	uint8_t seed[SHA256_DIGEST_LENGTH];
+          +#if defined(SWEET)
+          +	/* Hash without depending on the absent corecrypto kext's dispatch table. */
+          +	const struct ccdigest_info *di = &ccsha256_ltc_di;
+          +	ccdigest_di_decl(di, ctx);
+          +	ccdigest_init(di, ctx);
+          +	ccdigest_update(di, ctx, numbytes, buffer);
+          +	ccdigest_final(di, ctx, seed);
+          +	ccdigest_di_clear(di, ctx);
+          +#else
+           	SHA256_CTX ctx;
+           
+           	/* hash the input to minimize the time we need to hold the lock */
+           	SHA256_Init(&ctx);
+           	SHA256_Update(&ctx, buffer, numbytes);
+           	SHA256_Final(seed, &ctx);
+          +#endif
+           
+           	prng_funcs.reseed(prng_ctx, sizeof(seed), seed);
+           	cc_clear(sizeof(seed), seed);
+          diff --git a/osfmk/prng/entropy.c b/osfmk/prng/entropy.c
+          --- a/osfmk/prng/entropy.c
+          +++ b/osfmk/prng/entropy.c
+          @@ -40,6 +40,10 @@
+           #include <machine/machine_routines.h>
+           #include <libkern/section_keywords.h>
+           #include <sys/cdefs.h>
+          +#if defined(SWEET)
+          +#include <corecrypto/ccdigest.h>
+          +#include <corecrypto/ccsha2.h>
+          +#endif
+           
+           // The number of samples we can hold in an entropy buffer.
+           #define ENTROPY_MAX_SAMPLE_COUNT (2048)
+          @@ -93,13 +97,14 @@
+           	// State for a SHA256 computation. This is used to accumulate
+           	// entropy samples from across all CPUs. It is finalized when
+           	// entropy is provided to the consumer of this module.
+          +#if defined(SWEET)
+          +	ccdigest_ctx_decl(CCSHA256_STATE_SIZE, CCSHA256_BLOCK_SIZE, sha256_ctx);
+          +#else
+           	SHA256_CTX sha256_ctx;
+          -
+          -	// Since the corecrypto kext is not loaded when this module is
+          -	// initialized, we cannot initialize the SHA256 state at that
+          -	// time. Instead, we initialize it lazily during entropy
+          -	// consumption. This flag tracks whether initialization is
+          -	// complete.
+          +#endif
+          +
+          +	// Initialize the hash lazily during entropy consumption. On Apple
+          +	// platforms this also waits for the corecrypto kext to be loaded.
+           	bool sha256_ctx_init;
+           
+           	// A buffer to hold a bitmap with one bit per sample of an entropy
+          @@ -473,6 +478,38 @@
+           	return result;
+           }
+           
+          +/* SWEET uses the same built-in digest as early_random, without a kext. */
+          +static void
+          +entropy_hash_init(void)
+          +{
+          +#if defined(SWEET)
+          +	ccdigest_init(&ccsha256_ltc_di, entropy_data.sha256_ctx);
+          +#else
+          +	SHA256_Init(&entropy_data.sha256_ctx);
+          +#endif
+          +}
+          +
+          +static void
+          +entropy_hash_update(const void *data, size_t nbytes)
+          +{
+          +#if defined(SWEET)
+          +	ccdigest_update(&ccsha256_ltc_di, entropy_data.sha256_ctx, nbytes, data);
+          +#else
+          +	SHA256_Update(&entropy_data.sha256_ctx, data, nbytes);
+          +#endif
+          +}
+          +
+          +static void
+          +entropy_hash_final(void *out)
+          +{
+          +#if defined(SWEET)
+          +	ccdigest_final(&ccsha256_ltc_di, entropy_data.sha256_ctx, out);
+          +	ccdigest_ctx_clear(CCSHA256_STATE_SIZE, CCSHA256_BLOCK_SIZE, entropy_data.sha256_ctx);
+          +#else
+          +	SHA256_Final(out, &entropy_data.sha256_ctx);
+          +#endif
+          +}
+          +
+           int32_t
+           entropy_provide(size_t *entropy_size, void *entropy, __unused void *arg)
+           {
+          @@ -485,12 +522,13 @@
+           	int32_t sample_count = 0;
+           	*entropy_size = 0;
+           
+          -	// The first call to this function comes while the corecrypto kext
+          -	// is being loaded. We require SHA256 to accumulate entropy
+          -	// samples.
+          +	// Apple platforms need the corecrypto kext's SHA256 implementation.
+          +	// SWEET links the digest into the kernel instead.
+          +#if !defined(SWEET)
+           	if (__improbable(!crypto_init)) {
+           		return sample_count;
+           	}
+          +#endif
+           
+           	// There is only one consumer (the kernel PRNG), but they could
+           	// try to consume entropy from different threads. We simply fail
+          @@ -499,11 +537,9 @@
+           		return sample_count;
+           	}
+           
+          -	// This only happens on the first call to this function. We cannot
+          -	// perform this initialization in entropy_init because the
+          -	// corecrypto kext is not loaded yet.
+          +	// Initialize the accumulator on first use, after SHA256 is available.
+           	if (__improbable(!entropy_data.sha256_ctx_init)) {
+          -		SHA256_Init(&entropy_data.sha256_ctx);
+          +		entropy_hash_init();
+           		entropy_data.sha256_ctx_init = true;
+           	}
+           
+          @@ -539,7 +575,7 @@
+           		// We accumulate the samples regardless of whether the test
+           		// failed or a particular sample was filtered. It cannot hurt.
+           		entropy_data.total_sample_count += filtered_sample_count;
+          -		SHA256_Update(&entropy_data.sha256_ctx, e->samples, cpu_sample_count * sizeof(e->samples[0]));
+          +		entropy_hash_update(e->samples, cpu_sample_count * sizeof(e->samples[0]));
+           
+           		// "Drain" the per-CPU buffer by resetting its sample count.
+           		os_atomic_store(&e->sample_count, 0, relaxed);
+          @@ -576,8 +612,8 @@
+           		goto out;
+           	}
+           
+          -	SHA256_Final(entropy, &entropy_data.sha256_ctx);
+          -	SHA256_Init(&entropy_data.sha256_ctx);
+          +	entropy_hash_final(entropy);
+          +	entropy_hash_init();
+           	entropy_data.read_sample_count = entropy_data.total_sample_count;
+           
+           	sample_count = n;
+          PATCH
+          printf '%s\n' '04d13bf3c6c2e23c95c55677a6aa8f1e5c69971d8615eee7d0f05ba9d6963237  dxb/patches/0022-sweet-kernel-hmac-prng.patch' | shasum -a 256 -c -
+
+          cat > dxb/patches/0023-sweet-unavailable-trust-cache-runtime.patch <<'PATCH'
+          diff --git a/bsd/kern/kern_trustcache.c b/bsd/kern/kern_trustcache.c
+          --- a/bsd/kern/kern_trustcache.c
+          +++ b/bsd/kern/kern_trustcache.c
+          @@ -248,6 +248,21 @@
+           	allow_legacy_caches = true;
+           #endif
+           
+          +#if defined(SWEET)
+          +	/*
+          +	 * Standalone SWEET bring-up has no AppleImage4/AMFI kexts. Represent
+          +	 * the missing service explicitly: no caches can be loaded or matched.
+          +	 * Keep a NULL runtime through lockdown rather than a partially
+          +	 * initialized runtime that would later dereference absent callbacks.
+          +	 */
+          +	if (img4if == NULL || amfi == NULL) {
+          +		trust_cache_rt = NULL;
+          +		trust_cache_mut_rt = NULL;
+          +		printf("SWEET: trust caches unavailable (Image4/AMFI not installed)\n");
+          +		return;
+          +	}
+          +#endif
+          +
+           	/* Image4 interface needs to be available */
+           	if (img4if == NULL) {
+           		panic("image4 interface not available");
+          @@ -478,6 +493,12 @@
+           		return KERN_INVALID_ARGUMENT;
+           	}
+           
+          +#if defined(SWEET)
+          +	if (trust_cache_rt == NULL) {
+          +		return KERN_NOT_FOUND;
+          +	}
+          +#endif
+          +
+           #if   PMAP_CS_PPL_MONITOR
+           	ret = ppl_check_trust_cache_runtime_for_uuid(check_uuid);
+           #else
+          @@ -561,6 +582,12 @@
+           			panic("overflow on the ext manifest: %p | %lu", img4_aux_manifest, img4_aux_manifest_len);
+           		}
+           	}
+          +
+          +#if defined(SWEET)
+          +	if (trust_cache_rt == NULL) {
+          +		return KERN_NOT_SUPPORTED;
+          +	}
+          +#endif
+           
+           	/*
+           	 * If we don't have an external manifest provided, we expect the img4_object to have
+          @@ -668,6 +695,12 @@
+           		panic("overflow on the module: %p | %lu", module_data, module_size);
+           	}
+           
+          +#if defined(SWEET)
+          +	if (trust_cache_rt == NULL) {
+          +		return KERN_NOT_SUPPORTED;
+          +	}
+          +#endif
+          +
+           #if   PMAP_CS_PPL_MONITOR
+           	ret = ppl_load_legacy_trust_cache(module_data, module_size);
+           #else
+          @@ -695,6 +728,15 @@
+           		printf("unable to query trust caches: no cdhash provided\n");
+           		return KERN_INVALID_ARGUMENT;
+           	}
+          +
+          +#if defined(SWEET)
+          +	if (trust_cache_rt == NULL) {
+          +		if (query_type >= kTCQueryTypeTotal) {
+          +			return KERN_INVALID_ARGUMENT;
+          +		}
+          +		return KERN_NOT_FOUND;
+          +	}
+          +#endif
+           
+           #if   PMAP_CS_PPL_MONITOR
+           	ret = ppl_query_trust_cache(query_type, cdhash, query_token);
+          @@ -904,6 +946,12 @@
+           	*capabilities0_ret = kTCCapabilityNone;
+           	*capabilities1_ret = kTCCapabilityNone;
+           
+          +#if defined(SWEET)
+          +	if (trust_cache_rt == NULL) {
+          +		return KERN_NOT_SUPPORTED;
+          +	}
+          +#endif
+          +
+           	/* Ensure static trust caches have been initialized */
+           	if (trust_cache_static_init == false) {
+           		panic("attempted to query static trust cache capabilities without init");
+          PATCH
+          printf '%s\n' '52c922333707deb9f9e697cf5ba092213dcb578f36ca209e750582a650b1eb18  dxb/patches/0023-sweet-unavailable-trust-cache-runtime.patch' | shasum -a 256 -c -
+
+          cat > dxb/patches/0024-sweet-device-tree-platform-expert.patch <<'PATCH'
+          diff --git a/iokit/KernelConfigTables.cpp b/iokit/KernelConfigTables.cpp
+          --- a/iokit/KernelConfigTables.cpp
+          +++ b/iokit/KernelConfigTables.cpp
+          @@ -34,6 +34,14 @@
+           
+           const char * gIOKernelConfigTables =
+               "("
+          +#if defined(ARM64_BOARD_CONFIG_SWEET)
+          +    "   {"
+          +    "     'IOClass'         = SweetPlatformExpert;"
+          +    "     'IOProviderClass' = IOPlatformExpertDevice;"
+          +    "     'IONameMatch'     = 'xiaomi,sweet';"
+          +    "     'IOProbeScore'    = 10000:32;"
+          +    "   },"
+          +#endif
+               "   {"
+               "     'IOClass'         = IOPanicPlatform;"
+               "     'IOProviderClass' = IOPlatformExpertDevice;"
+          diff --git a/iokit/conf/files.arm64 b/iokit/conf/files.arm64
+          --- a/iokit/conf/files.arm64
+          +++ b/iokit/conf/files.arm64
+          @@ -5,3 +5,6 @@
+           
+           # SMP
+           iokit/Kernel/arm/AppleARMSMP.cpp    					optional iokitcpp
+          +
+          +# SWEET device-tree platform (empty translation unit on other boards)
+          +iokit/Kernel/arm/SweetPlatformExpert.cpp                         optional iokitcpp
+          diff --git a/iokit/Kernel/arm/SweetPlatformExpert.cpp b/iokit/Kernel/arm/SweetPlatformExpert.cpp
+          new file mode 100644
+          --- /dev/null
+          +++ b/iokit/Kernel/arm/SweetPlatformExpert.cpp
+          @@ -0,0 +1,86 @@
+          +/*
+          + * Minimal device-tree platform expert for Redmi Note 10 Pro (sweet).
+          + * Uses XNU's normal platform, power-domain and nub initialization. Hardware
+          + * interrupt and power-management services are supplied by separate drivers.
+          + */
+          +#include <pexpert/arm64/board_config.h>
+          +
+          +#if defined(SWEET)
+          +#include <IOKit/IOPlatformExpert.h>
+          +#include <IOKit/IODeviceTreeSupport.h>
+          +#include <IOKit/IOLib.h>
+          +
+          +class SweetPlatformExpert : public IODTPlatformExpert {
+          +	OSDeclareDefaultStructors(SweetPlatformExpert);
+          +
+          +public:
+          +	bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
+          +	void processTopLevel(IORegistryEntry *root) APPLE_KEXT_OVERRIDE;
+          +	const char *deleteList(void) APPLE_KEXT_OVERRIDE;
+          +	const char *excludeList(void) APPLE_KEXT_OVERRIDE;
+          +	bool getTargetName(char *name, int maxLength) APPLE_KEXT_OVERRIDE;
+          +	bool getProductName(char *name, int maxLength) APPLE_KEXT_OVERRIDE;
+          +};
+          +
+          +OSDefineMetaClassAndStructors(SweetPlatformExpert, IODTPlatformExpert);
+          +
+          +bool
+          +SweetPlatformExpert::start(IOService *provider)
+          +{
+          +	IOLog("SWEET: starting device-tree platform expert\n");
+          +	if (!IODTPlatformExpert::start(provider)) {
+          +		return false;
+          +	}
+          +	registerService();
+          +	IOLog("SWEET: platform expert registered\n");
+          +	return true;
+          +}
+          +
+          +const char *
+          +SweetPlatformExpert::deleteList(void)
+          +{
+          +	return "()";
+          +}
+          +
+          +const char *
+          +SweetPlatformExpert::excludeList(void)
+          +{
+          +	return "('chosen', 'defaults', 'cpus', 'options')";
+          +}
+          +
+          +void
+          +SweetPlatformExpert::processTopLevel(IORegistryEntry *root)
+          +{
+          +	/*
+          +	 * The stock implementation requires an Apple NVRAM /options node.
+          +	 * SWEET has no NVRAM controller; publish real CPU/device nodes without
+          +	 * inventing one. createNubs adds the topology's logical CPU/cluster IDs.
+          +	 */
+          +	IORegistryEntry *cpus = root->childFromPath("cpus", gIODTPlane);
+          +	if (cpus != NULL) {
+          +		createNubs(this, IODTFindMatchingEntries(cpus, kIODTExclusive, NULL));
+          +		cpus->release();
+          +	}
+          +	createNubs(this, IODTFindMatchingEntries(root, kIODTExclusive, excludeList()));
+          +}
+          +
+          +bool
+          +SweetPlatformExpert::getTargetName(char *name, int maxLength)
+          +{
+          +	if (name == NULL || maxLength <= 0) {
+          +		return false;
+          +	}
+          +	strlcpy(name, "sweet", (size_t)maxLength);
+          +	return true;
+          +}
+          +
+          +bool
+          +SweetPlatformExpert::getProductName(char *name, int maxLength)
+          +{
+          +	if (name == NULL || maxLength <= 0) {
+          +		return false;
+          +	}
+          +	strlcpy(name, "Redmi Note 10 Pro", (size_t)maxLength);
+          +	return true;
+          +}
+          +#endif /* SWEET */
+          PATCH
+          printf '%s\n' 'b71c0fc56d832537a6ca096a3fe4893c498c234adb4fde419e1a791de74172ab  dxb/patches/0024-sweet-device-tree-platform-expert.patch' | shasum -a 256 -c -
+
+          cat > dxb/patches/0025-sweet-device-tree-virtual-timer-irq.patch <<'PATCH'
+          diff --git a/pexpert/arm/pe_fiq.c b/pexpert/arm/pe_fiq.c
+          --- a/pexpert/arm/pe_fiq.c
+          +++ b/pexpert/arm/pe_fiq.c
+          @@ -3,7 +3,8 @@
+            */
+           
+           #include <stdint.h>
+          +#include <libkern/section_keywords.h>
+           #include <arm64/sweet_early.h>
+           #include <arm64/proc_reg.h>
+           #include <kern/clock.h>
+           #include <mach/mach_time.h>
+          @@ -15,6 +16,11 @@
+           #if HAS_GIC_V3
+           #define GICR_WAKE_TIMEOUT_NS (1000000000ULL) // timeout for redistributor wakeup (default 1s)
+           MACHINE_TIMEOUT(gicr_wake_timeout_ns, "gicr-wake-timeout", GICR_WAKE_TIMEOUT_NS, MACHINE_TIMEOUT_UNIT_NSEC, NULL);
+          +
+          +#if defined(SWEET)
+          +/* Phone default; QEMU virt wires the architected virtual timer to INTID 27. */
+          +SECURITY_READ_ONLY_LATE(uint32_t) sweet_vtimer_intid = SWEET_VTIMER_INTID;
+          +#endif
+           
+           static vm_offset_t gicd_base;
+           static vm_offset_t gicr_base;
+          @@ -95,6 +101,23 @@
+           		if (prop_size < 4 * sizeof(uint64_t)) {
+           			panic("%s: incorrect reg property size in GIC DT node; expecting 32 bytes but got %u bytes", __func__, prop_size);
+           		}
+          +
+          +#if defined(SWEET)
+          +		/* Read only on the boot CPU, before the GIC and RO-late lockdown. */
+          +		void const *timer_prop;
+          +		unsigned int timer_size;
+          +		if (SecureDTGetProperty(entry, "virtual-timer-intid", &timer_prop, &timer_size) == kSuccess) {
+          +			if (timer_size != sizeof(uint32_t)) {
+          +				panic("%s: invalid virtual-timer-intid size %u", __func__, timer_size);
+          +			}
+          +			uint32_t intid = *(const uint32_t *)timer_prop;
+          +			if (intid < 16 || intid >= 32) {
+          +				panic("%s: virtual timer INTID %u is not a PPI", __func__, intid);
+          +			}
+          +			sweet_vtimer_intid = intid;
+          +		}
+          +		kprintf("SWEET GIC: virtual timer INTID %u\n", sweet_vtimer_intid);
+          +#endif
+           
+           		vm_offset_t soc_base_phys = pe_arm_get_soc_base_phys();
+           
+          @@ -152,7 +175,7 @@
+           	for (unsigned int i = 0; i < 32; i += 4) {
+           		gicr_write32(GICR_IPRIORITYR0 + i, 0xA0A0A0A0);
+           	}
+          -	gicr_write32(GICR_ISENABLER0, (1U << SWEET_VTIMER_INTID) | (1U << SWEET_IPI_SGI));
+          +	gicr_write32(GICR_ISENABLER0, (1U << sweet_vtimer_intid) | (1U << SWEET_IPI_SGI));
+           #else
+           	// Configure timers and legacy FIQ to be group 0
+           	gicr_write32(GICR_IGROUPR0, 0x81FFFFFF);
+          diff --git a/osfmk/arm64/sleh.c b/osfmk/arm64/sleh.c
+          --- a/osfmk/arm64/sleh.c
+          +++ b/osfmk/arm64/sleh.c
+          @@ -1867,7 +1867,7 @@
+           	if (intid >= 1020 && intid <= 1023) {
+           		return; /* spurious */
+           	}
+          -	if (intid == SWEET_VTIMER_INTID) {
+          +	if (intid == sweet_vtimer_intid) {
+           		sleh_interrupt_handler_prologue(state, DBG_INTR_TYPE_TIMER);
+           		cdp->cpu_decrementer = -1; /* Large */
+           		INTERRUPT_MASKED_DEBUG_START(rtclock_intr, DBG_INTR_TYPE_TIMER);
+          diff --git a/pexpert/pexpert/arm/protos.h b/pexpert/pexpert/arm/protos.h
+          --- a/pexpert/pexpert/arm/protos.h
+          +++ b/pexpert/pexpert/arm/protos.h
+          @@ -36,6 +36,9 @@
+           int uart_getc(void);
+           
+           void pe_init_fiq(void);
+          +#if defined(ARM64_BOARD_CONFIG_SWEET)
+          +extern uint32_t sweet_vtimer_intid;
+          +#endif
+           
+           #ifdef PRIVATE
+           /**
+          PATCH
+          printf '%s\n' '06d837aa858d5da5c4aa7a6372ed10ae24021d97e7a3c740df4752f935b74358  dxb/patches/0025-sweet-device-tree-virtual-timer-irq.patch' | shasum -a 256 -c -
+
+          cat > dxb/patches/0026-sweet-boot-cpu-driver.patch <<'PATCH'
+          diff --git a/iokit/Kernel/arm/SweetCPU.cpp b/iokit/Kernel/arm/SweetCPU.cpp
+          new file mode 100644
+          --- /dev/null
+          +++ b/iokit/Kernel/arm/SweetCPU.cpp
+          @@ -0,0 +1,171 @@
+          +/*
+          + * Single-CPU bring-up for sweet using XNU's legacy IOCPU interface.
+          + * The architected timer and SGI1 already enter through pe_fiq/sleh_irq.
+          + * Secondary CPU startup and system suspend require separate platform work.
+          + */
+          +#include <pexpert/arm64/board_config.h>
+          +
+          +#if defined(SWEET)
+          +#include <IOKit/IOCPU.h>
+          +#include <IOKit/IOLib.h>
+          +#include <libkern/c++/OSData.h>
+          +#include <libkern/c++/OSNumber.h>
+          +#include <arm64/proc_reg.h>
+          +#include <machine/atomic.h>
+          +#include <kern/clock.h>
+          +#include <kern/processor.h>
+          +#include <mach/mach_time.h>
+          +
+          +class SweetCPU : public IOCPU {
+          +	OSDeclareDefaultStructors(SweetCPU);
+          +	const OSSymbol *cpuName = NULL;
+          +
+          +public:
+          +	bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
+          +	void free(void) APPLE_KEXT_OVERRIDE;
+          +	void initCPU(bool boot) APPLE_KEXT_OVERRIDE;
+          +	void quiesceCPU(void) APPLE_KEXT_OVERRIDE;
+          +	kern_return_t startCPU(vm_offset_t start_paddr, vm_offset_t arg_paddr) APPLE_KEXT_OVERRIDE;
+          +	void haltCPU(void) APPLE_KEXT_OVERRIDE;
+          +	void signalCPU(IOCPU *target) APPLE_KEXT_OVERRIDE;
+          +	const OSSymbol *getCPUName(void) APPLE_KEXT_OVERRIDE;
+          +};
+          +
+          +OSDefineMetaClassAndStructors(SweetCPU, IOCPU);
+          +
+          +bool
+          +SweetCPU::start(IOService *provider)
+          +{
+          +	const ml_topology_info_t *topology = ml_get_topology_info();
+          +	const ml_topology_cpu_t *cpu = topology->boot_cpu;
+          +	OSNumber *logical = OSDynamicCast(OSNumber, provider->getProperty("logical-cpu-id"));
+          +	OSData *reg = OSDynamicCast(OSData, provider->getProperty("reg"));
+          +
+          +	if (logical == NULL || reg == NULL || reg->getLength() != sizeof(uint32_t) ||
+          +	    logical->unsigned32BitValue() != cpu->cpu_id ||
+          +	    *(const uint32_t *)reg->getBytesNoCopy() != cpu->phys_id) {
+          +		return false;
+          +	}
+          +	if (topology->num_cpus != 1) {
+          +		panic("SWEET CPU: only single-CPU bring-up is supported");
+          +	}
+          +	if (!IOCPU::start(provider)) {
+          +		return false;
+          +	}
+          +	cpuName = OSSymbol::withCStringNoCopy("Kryo 470");
+          +	if (cpuName == NULL) {
+          +		return false;
+          +	}
+          +	setCPUNumber(cpu->cpu_id);
+          +
+          +	ml_processor_info_t info = {};
+          +	info.cpu_id = reinterpret_cast<cpu_id_t>(this);
+          +	info.phys_id = cpu->phys_id;
+          +	info.log_id = cpu->cpu_id;
+          +	info.cluster_id = cpu->cluster_id;
+          +	info.cluster_type = cpu->cluster_type;
+          +	info.l2_cache_id = cpu->l2_cache_id;
+          +	info.l2_cache_size = cpu->l2_cache_size;
+          +	info.l3_cache_id = cpu->l3_cache_id;
+          +	info.l3_cache_size = cpu->l3_cache_size;
+          +	perfmon_interrupt_handler_func pmi_handler = NULL;
+          +	kern_return_t result = ml_processor_register(&info, &machProcessor, &ipi_handler, &pmi_handler);
+          +	if (result != KERN_SUCCESS) {
+          +		panic("SWEET CPU: ml_processor_register failed: %d", result);
+          +	}
+          +	if (pmi_handler != NULL) {
+          +		panic("SWEET CPU: PMI routing is not implemented");
+          +	}
+          +
+          +	/* Re-enter the boot CPU through cpu_machine_init -> PE_cpu_machine_init. */
+          +	result = processor_start(machProcessor);
+          +	if (result != KERN_SUCCESS || getCPUState() != kIOCPUStateRunning) {
+          +		panic("SWEET CPU: processor_start failed: %d", result);
+          +	}
+          +	ml_cpu_init_completed();
+          +	cpusRunning();
+          +	registerService();
+          +	IOService::publishResource(gIOAllCPUInitializedKey, kOSBooleanTrue);
+          +
+          +	/* Announce completion only after registration, startup and SGI validation. */
+          +	ml_set_max_cpus(topology->max_cpu_id + 1);
+          +	IOLog("SWEET CPU: boot CPU %u registered, SGI1 verified, initialization complete\n",
+          +	    getCPUNumber());
+          +	return true;
+          +}
+          +
+          +void
+          +SweetCPU::free(void)
+          +{
+          +	OSSafeReleaseNULL(cpuName);
+          +	IOCPU::free();
+          +}
+          +
+          +void
+          +SweetCPU::initCPU(bool boot)
+          +{
+          +	if (!boot) {
+          +		panic("SWEET CPU: resume is not implemented");
+          +	}
+          +	assert(cpu_number() == (int)getCPUNumber());
+          +	assert(ml_get_interrupts_enabled());
+          +	ml_broadcast_cpu_event(CPU_BOOTED, getCPUNumber());
+          +
+          +	/* A real GIC interrupt clears SIGPdisabled in cpu_signal_handler. */
+          +	uint64_t deadline;
+          +	nanoseconds_to_deadline(NSEC_PER_SEC, &deadline);
+          +	signalCPU(this);
+          +	while (!ml_cpu_signal_is_enabled()) {
+          +		if (mach_absolute_time() > deadline) {
+          +			panic("SWEET CPU: SGI1 self-test timed out");
+          +		}
+          +		__asm__ volatile("yield");
+          +	}
+          +	setCPUState(kIOCPUStateRunning);
+          +}
+          +
+          +void
+          +SweetCPU::signalCPU(IOCPU *target)
+          +{
+          +	/* Only the boot CPU is registered by this driver. */
+          +	if (target != this || cpu_number() != (int)getCPUNumber()) {
+          +		panic("SWEET CPU: secondary CPU signalling is not implemented");
+          +	}
+          +	uint64_t mpidr = __builtin_arm_rsr64("MPIDR_EL1");
+          +	unsigned int aff0 = mpidr & 0xff;
+          +	if (aff0 >= 16) {
+          +		panic("SWEET CPU: SGI target requires unsupported range selector");
+          +	}
+          +	uint64_t sgi = (((mpidr >> 32) & 0xff) << 48) |
+          +	    (((mpidr >> 16) & 0xff) << 32) |
+          +	    (((mpidr >> 8) & 0xff) << 16) |
+          +	    ((uint64_t)SWEET_IPI_SGI << 24) | (1ULL << aff0);
+          +	__builtin_arm_dsb(DSB_ISHST);
+          +	__builtin_arm_wsr64("ICC_SGI1R_EL1", sgi);
+          +	__builtin_arm_isb(ISB_SY);
+          +}
+          +
+          +kern_return_t
+          +SweetCPU::startCPU(vm_offset_t start_paddr __unused, vm_offset_t arg_paddr __unused)
+          +{
+          +	return KERN_NOT_SUPPORTED;
+          +}
+          +
+          +void
+          +SweetCPU::quiesceCPU(void)
+          +{
+          +	panic("SWEET CPU: CPU quiesce is not implemented");
+          +}
+          +
+          +void
+          +SweetCPU::haltCPU(void)
+          +{
+          +	panic("SWEET CPU: CPU halt/suspend is not implemented");
+          +}
+          +
+          +const OSSymbol *
+          +SweetCPU::getCPUName(void)
+          +{
+          +	return cpuName;
+          +}
+          +#endif /* SWEET */
+          diff --git a/iokit/KernelConfigTables.cpp b/iokit/KernelConfigTables.cpp
+          --- a/iokit/KernelConfigTables.cpp
+          +++ b/iokit/KernelConfigTables.cpp
+          @@ -41,6 +41,12 @@
+               "     'IONameMatch'     = 'xiaomi,sweet';"
+               "     'IOProbeScore'    = 10000:32;"
+               "   },"
+          +    "   {"
+          +    "     'IOClass'         = SweetCPU;"
+          +    "     'IOProviderClass' = IOPlatformDevice;"
+          +    "     'IONameMatch'     = 'qcom,kryo470';"
+          +    "     'IOProbeScore'    = 10000:32;"
+          +    "   },"
+           #endif
+               "   {"
+               "     'IOClass'         = IOPanicPlatform;"
+          diff --git a/iokit/conf/files.arm64 b/iokit/conf/files.arm64
+          --- a/iokit/conf/files.arm64
+          +++ b/iokit/conf/files.arm64
+          @@ -8,3 +8,5 @@
+           
+           # SWEET device-tree platform (empty translation unit on other boards)
+           iokit/Kernel/arm/SweetPlatformExpert.cpp                         optional iokitcpp
+          +
+          +iokit/Kernel/arm/SweetCPU.cpp                                    optional iokitcpp
+          PATCH
+          printf '%s\n' '06de6e84d8ff9b0307872fb78a827e84fc1e16a1b7286a87f0e618a5dc2692a9  dxb/patches/0026-sweet-boot-cpu-driver.patch' | shasum -a 256 -c -
+
+          cat > dxb/patches/0027-sweet-builtin-pthread.patch <<'PATCH'
+          diff --git a/bsd/conf/files b/bsd/conf/files
+          --- a/bsd/conf/files
+          +++ b/bsd/conf/files
+          @@ -361,6 +361,9 @@
+           bsd/security/audit/audit_worker.c		optional config_audit
+           
+           bsd/pthread/pthread_shims.c		standard
+          +bsd/pthread/sweet_pthread_init.c	standard
+          +bsd/pthread/sweet_pthread_support.c	standard
+          +bsd/pthread/sweet_pthread_synch.c	standard
+           bsd/pthread/pthread_priority.c		standard
+           bsd/pthread/pthread_workqueue.c		standard
+           
+          diff --git a/bsd/conf/Makefile.template b/bsd/conf/Makefile.template
+          --- a/bsd/conf/Makefile.template
+          +++ b/bsd/conf/Makefile.template
+          @@ -43,6 +43,15 @@
+           	-DBSD_KERNEL_PRIVATE -DLP64_DEBUG=0 \
+                   -Warray-bounds-pointer-arithmetic
+           SFLAGS+= -include meta_features.h
+          +
+          +# This provider is built into SWEET; other boards use their normal kext.
+          +ifeq ($(CURRENT_MACHINE_CONFIG),SWEET)
+          +SWEET_PTHREAD_ROOT = $(SRCROOT)/bsd/pthread/sweet_libpthread
+          +SWEET_PTHREAD_INC = -I$(SWEET_PTHREAD_ROOT) -I$(SWEET_PTHREAD_ROOT)/private -I$(SWEET_PTHREAD_ROOT)/include
+          +sweet_pthread_init.o_INCFLAGS = $(SWEET_PTHREAD_INC)
+          +sweet_pthread_support.o_INCFLAGS = $(SWEET_PTHREAD_INC)
+          +sweet_pthread_synch.o_INCFLAGS = $(SWEET_PTHREAD_INC)
+          +endif
+           
+           #
+           # Directories for mig generated files
+          diff --git a/bsd/sys/pthread_internal.h b/bsd/sys/pthread_internal.h
+          --- a/bsd/sys/pthread_internal.h
+          +++ b/bsd/sys/pthread_internal.h
+          @@ -34,7 +34,12 @@
+           
+           struct ksyn_waitq_element {
+           #if __LP64__
+          +	#if defined(ARM64_BOARD_CONFIG_SWEET)
+          +	/* libpthread-514.100.2 includes the trailing kwe_uth pointer. */
+          +	char opaque[56];
+          +#else
+           	char opaque[48];
+          +#endif
+           #else
+           	char opaque[32];
+           #endif
+          diff --git a/bsd/pthread/sweet_pthread_compat.h b/bsd/pthread/sweet_pthread_compat.h
+          new file mode 100644
+          --- /dev/null
+          +++ b/bsd/pthread/sweet_pthread_compat.h
+          @@ -0,0 +1,25 @@
+          +/*
+          + * Compile the matching libpthread provider with its kext view of BSD headers.
+          + * It owns its full ksyn_waitq_element layout; the kernel's opaque counterpart
+          + * reserves this layout. All communication with private BSD state uses callbacks.
+          + */
+          +#ifndef SWEET_PTHREAD_COMPAT_H
+          +#define SWEET_PTHREAD_COMPAT_H
+          +#undef BSD_KERNEL_PRIVATE
+          +#undef XNU_KERNEL_PRIVATE
+          +#define __PTHREAD_EXPOSE_INTERNALS__ 1
+          +#define NEEDS_SCHED_CALL_T 1
+          +
+          +/* The seven-argument kext API forwards to the eight-argument kernel vm_fault. */
+          +#define vm_fault vm_fault_external
+          +
+          +/* Avoid collisions with the kernel side of the callback interface. */
+          +#define pthread_kern sweet_pthread_kern
+          +#define current_uthread sweet_pthread_current_uthread
+          +#define pthread_start sweet_pthread_start
+          +#define pthread_stop sweet_pthread_stop
+          +
+          +/* os/log passes &__dso_handle as the containing Mach-O image address. */
+          +extern void *sweet_pthread_log_image __asm("__mh_execute_header");
+          +#define __dso_handle sweet_pthread_log_image
+          +#endif
+          diff --git a/bsd/pthread/sweet_pthread_init.c b/bsd/pthread/sweet_pthread_init.c
+          new file mode 100644
+          --- /dev/null
+          +++ b/bsd/pthread/sweet_pthread_init.c
+          @@ -0,0 +1,26 @@
+          +/* Built-in provider: Apple libpthread-514.100.2, paired with xnu-8796.141.3. */
+          +#if defined(ARM64_BOARD_CONFIG_SWEET)
+          +#include "sweet_pthread_compat.h"
+          +#include "sweet_libpthread/kern/kern_init.c"
+          +
+          +/* Keep the provider's full layout within the kernel's reserved storage. */
+          +_Static_assert(sizeof(struct ksyn_waitq_element) == 56,
+          +    "update SWEET ksyn storage in sys/pthread_internal.h");
+          +
+          +/* Restore the startup interface after compiling the provider's kext code. */
+          +#define XNU_KERNEL_PRIVATE 1
+          +#include <kern/startup.h>
+          +#include <pexpert/pexpert.h>
+          +
+          +__startup_func
+          +static void
+          +sweet_pthread_register(void)
+          +{
+          +    kern_return_t kr = sweet_pthread_start(NULL, NULL);
+          +    if (kr != KERN_SUCCESS || sweet_pthread_kern == NULL) {
+          +        panic("SWEET: pthread provider registration failed: %d", kr);
+          +    }
+          +    kprintf("SWEET pthread: libpthread-514.100.2 registered\n");
+          +}
+          +STARTUP(EARLY_BOOT, STARTUP_RANK_SECOND, sweet_pthread_register);
+          +#endif /* ARM64_BOARD_CONFIG_SWEET */
+          diff --git a/bsd/pthread/sweet_pthread_support.c b/bsd/pthread/sweet_pthread_support.c
+          new file mode 100644
+          --- /dev/null
+          +++ b/bsd/pthread/sweet_pthread_support.c
+          @@ -0,0 +1,5 @@
+          +/* Built-in provider: Apple libpthread-514.100.2, paired with xnu-8796.141.3. */
+          +#if defined(ARM64_BOARD_CONFIG_SWEET)
+          +#include "sweet_pthread_compat.h"
+          +#include "sweet_libpthread/kern/kern_support.c"
+          +#endif /* ARM64_BOARD_CONFIG_SWEET */
+          diff --git a/bsd/pthread/sweet_pthread_synch.c b/bsd/pthread/sweet_pthread_synch.c
+          new file mode 100644
+          --- /dev/null
+          +++ b/bsd/pthread/sweet_pthread_synch.c
+          @@ -0,0 +1,5 @@
+          +/* Built-in provider: Apple libpthread-514.100.2, paired with xnu-8796.141.3. */
+          +#if defined(ARM64_BOARD_CONFIG_SWEET)
+          +#include "sweet_pthread_compat.h"
+          +#include "sweet_libpthread/kern/kern_synch.c"
+          +#endif /* ARM64_BOARD_CONFIG_SWEET */
+          PATCH
+          printf '%s\n' 'ee34ec3e5876f1316c6665059c3c38a09602bc100d805cebe23f260e2033899d  dxb/patches/0027-sweet-builtin-pthread.patch' | shasum -a 256 -c -
+
+          cat > dxb/patches/0028-x00td-boot-cpu-irq-enable.patch <<'PATCH'
+          diff --git a/pexpert/arm/pe_fiq.c b/pexpert/arm/pe_fiq.c
+          --- a/pexpert/arm/pe_fiq.c
+          +++ b/pexpert/arm/pe_fiq.c
+          @@ -68,6 +68,22 @@
+           	panic("%s: cannot find GICR base for core %u", __func__, ml_get_cpu_number(phys_id));
+           }
+           
+          +#if defined(SWEET)
+          +/* X00TD boot CPU: v24 readback showed SGI/timer pending with enable=0.
+          + * Preserve the real IRQ self-test and request the interrupt through GICR. */
+          +void
+          +x00td_send_self_sgi(void)
+          +{
+          +	vm_offset_t gicr_pe_base = find_gicr_pe_base();
+          +	*(volatile uint8_t *)(gicr_pe_base + GICR_IPRIORITYR0 + SWEET_IPI_SGI) = 0xa0;
+          +	*(volatile uint8_t *)(gicr_pe_base + GICR_IPRIORITYR0 + sweet_vtimer_intid) = 0xa0;
+          +	gicr_write32(GICR_ISENABLER0, (1U << sweet_vtimer_intid) | (1U << SWEET_IPI_SGI));
+          +	__asm__ volatile("dsb sy" ::: "memory");
+          +	gicr_write32(0x10200, 1U << SWEET_IPI_SGI);
+          +	__asm__ volatile("dsb sy\nisb" ::: "memory");
+          +}
+          +#endif
+          +
+           void
+           pe_init_fiq()
+           {
+          diff --git a/iokit/Kernel/arm/SweetCPU.cpp b/iokit/Kernel/arm/SweetCPU.cpp
+          --- a/iokit/Kernel/arm/SweetCPU.cpp
+          +++ b/iokit/Kernel/arm/SweetCPU.cpp
+          @@ -15,6 +15,8 @@
+           #include <kern/clock.h>
+           #include <kern/processor.h>
+           #include <mach/mach_time.h>
+          +
+          +extern "C" void x00td_send_self_sgi(void);
+           
+           class SweetCPU : public IOCPU {
+           	OSDeclareDefaultStructors(SweetCPU);
+          @@ -131,18 +133,7 @@
+           	if (target != this || cpu_number() != (int)getCPUNumber()) {
+           		panic("SWEET CPU: secondary CPU signalling is not implemented");
+           	}
+          -	uint64_t mpidr = __builtin_arm_rsr64("MPIDR_EL1");
+          -	unsigned int aff0 = mpidr & 0xff;
+          -	if (aff0 >= 16) {
+          -		panic("SWEET CPU: SGI target requires unsupported range selector");
+          -	}
+          -	uint64_t sgi = (((mpidr >> 32) & 0xff) << 48) |
+          -	    (((mpidr >> 16) & 0xff) << 32) |
+          -	    (((mpidr >> 8) & 0xff) << 16) |
+          -	    ((uint64_t)SWEET_IPI_SGI << 24) | (1ULL << aff0);
+          -	__builtin_arm_dsb(DSB_ISHST);
+          -	__builtin_arm_wsr64("ICC_SGI1R_EL1", sgi);
+          -	__builtin_arm_isb(ISB_SY);
+          +	x00td_send_self_sgi();
+           }
+           
+           kern_return_t
+          PATCH
+          printf '%s\n' '453600554a1a42a5309e4873052d56a59e072a084ecd5e14b432c2b4d43e4348  dxb/patches/0028-x00td-boot-cpu-irq-enable.patch' | shasum -a 256 -c -
+
+          cat > dxb/patches/0027-stage-libpthread.sh <<'PTHREAD_STAGE'
+          #!/bin/bash
+          # dxb runs patches/*.sh from the XNU source root before applying *.patch.
+          set -euo pipefail
+          
+          [[ "${MACHINE_CONFIG:-}" == SWEET ]] || exit 0
+          [[ "${MACOS_VERSION:-}" == 13.5 ]] || {
+              echo 'SWEET libpthread integration requires xnu-8796.141.3 (macOS 13.5)' >&2
+              exit 1
+          }
+          [[ -f bsd/pthread/pthread_shims.c ]] || exit 1
+          
+          # libpthread-514.100.2 is paired with xnu-8796.141.3 in Apple's macos-135
+          # release.json. Fetch the immutable commit, never a moving branch/tag.
+          pthread_sha=a6c70ca0e544347a0377babf748f831577ec24f9
+          pthread_tmp=$(mktemp -d)
+          trap 'rm -rf "$pthread_tmp"' EXIT
+          git init -q "$pthread_tmp"
+          git -C "$pthread_tmp" fetch -q --depth 1 \
+              https://github.com/apple-oss-distributions/libpthread "$pthread_sha"
+          git -C "$pthread_tmp" checkout -q FETCH_HEAD
+          [[ "$(git -C "$pthread_tmp" rev-parse HEAD)" == "$pthread_sha" ]]
+          
+          python3 - "$pthread_tmp" <<'PY'
+          from pathlib import Path
+          import shutil
+          import sys
+          
+          source = Path(sys.argv[1])
+          target = Path('bsd/pthread/sweet_libpthread')
+          if target.exists():
+              raise SystemExit(f'refusing to overwrite existing provider: {target}')
+          # Preserve upstream copyright/license headers; no downloaded sources in git.
+          for directory in ('kern', 'private', 'include'):
+              shutil.copytree(source / directory, target / directory)
+          
+          def replace(file, old, new, count):
+              path = target / 'kern' / file
+              text = path.read_text()
+              if text.count(old) != count:
+                  raise SystemExit(f'libpthread source changed: {file}: {old!r}')
+              path.write_text(text.replace(old, new))
+          
+          # The public kernel source has stricter address types than the kext SDK.
+          # Keep the address bits intact with explicit casts; user addresses use zero.
+          replace('kern_trace.h', 'vm_kernel_unslide_or_perm_external(ptr,',
+                  'vm_kernel_unslide_or_perm_external((vm_offset_t)ptr,', 1)
+          for callback, count in (('psynch_wait_update_owner', 4),
+                                  ('psynch_wait_complete', 1), ('psynch_wait_wakeup', 2)):
+              replace('kern_synch.c', f'pthread_kern->{callback}(kwq,',
+                      f'pthread_kern->{callback}((uintptr_t)kwq,', count)
+          replace('kern_support.c', '*kevent_list_out = NULL;', '*kevent_list_out = 0;', 1)
+          replace('kern_support.c', 'user_addr_t kevent_list = NULL;',
+                  'user_addr_t kevent_list = 0;', 2)
+          replace('kern_support.c', 'workq_kevent(p, &th_addrs, NULL,',
+                  'workq_kevent(p, &th_addrs, 0,', 1)
+          replace('kern_support.c',
+                  'panic(__func__ ": thread_set_wq_state failed: %d", error);',
+                  'panic("%s: thread_set_wq_state failed: %d", __func__, error);', 4)
+          PY
+          
+          # Kernel builds use -nostdinc. Carry the real SDK target definitions beside
+          # the provider so local compiles from the uploaded build tree work as well.
+          pthread_sdk=$(xcrun --sdk macosx --show-sdk-path)
+          cp "$pthread_sdk/usr/include/TargetConditionals.h" bsd/pthread/sweet_libpthread/
+          echo "Staged libpthread-514.100.2 ($pthread_sha) for SWEET"
+          PTHREAD_STAGE
+          printf '%s\n' '76db7a8c6db0fb4ce2dd70be21c2738749a60702951eb4542652389a693707c1  dxb/patches/0027-stage-libpthread.sh' | shasum -a 256 -c -
+          bash -n dxb/patches/0027-stage-libpthread.sh
+
+          cat > dxb/patches/0141-sapphire-iorpc-kernelcontent.patch <<'PATCH'
+          From c9c3ee8f11bcc2a372b70dee421c3719577dbe73 Mon Sep 17 00:00:00 2001
+          From: x <x@x>
+          Date: Tue, 20 Oct 2026 06:46:08 +0000
+          Subject: [PATCH] sapphire-0141: IORPC.kernelContent for Xcode 16+ iig
+          
+          Newer iig dispatch stubs take the decoded IORPCMessage from
+          IORPC.kernelContent (added in later xnu); xnu-8796 has no such field.
+          Add it (kernel only) and fill it where the kernel builds an IORPC from
+          a user message, as later xnu does, so the kernel builds with the
+          Xcode 16 that hosted macOS CI still offers.
+          ---
+           iokit/DriverKit/IORPC.h       | 5 +++++
+           iokit/IOKit/IORPC.h           | 5 +++++
+           iokit/Kernel/IOUserServer.cpp | 3 ++-
+           3 files changed, 12 insertions(+), 1 deletion(-)
+          
+          diff --git a/iokit/DriverKit/IORPC.h b/iokit/DriverKit/IORPC.h
+          index 3ded78c..c95c58c 100644
+          --- a/iokit/DriverKit/IORPC.h
+          +++ b/iokit/DriverKit/IORPC.h
+          @@ -224,6 +224,11 @@ struct IORPC {
+           	IORPCMessageMach * reply;
+           	uint32_t           sendSize;
+           	uint32_t           replySize;
+          +#ifdef KERNEL
+          +	/* sapphire: newer iig (Xcode 16+) dispatch stubs read the decoded
+          +	 * message from here instead of calling IORPCMessageFromMach() */
+          +	IORPCMessage     * kernelContent;
+          +#endif /* KERNEL */
+           };
+           typedef struct IORPC IORPC;
+           
+          diff --git a/iokit/IOKit/IORPC.h b/iokit/IOKit/IORPC.h
+          index 3ded78c..c95c58c 100644
+          --- a/iokit/IOKit/IORPC.h
+          +++ b/iokit/IOKit/IORPC.h
+          @@ -224,6 +224,11 @@ struct IORPC {
+           	IORPCMessageMach * reply;
+           	uint32_t           sendSize;
+           	uint32_t           replySize;
+          +#ifdef KERNEL
+          +	/* sapphire: newer iig (Xcode 16+) dispatch stubs read the decoded
+          +	 * message from here instead of calling IORPCMessageFromMach() */
+          +	IORPCMessage     * kernelContent;
+          +#endif /* KERNEL */
+           };
+           typedef struct IORPC IORPC;
+           
+          diff --git a/iokit/Kernel/IOUserServer.cpp b/iokit/Kernel/IOUserServer.cpp
+          index 5d1d922..1406bef 100644
+          --- a/iokit/Kernel/IOUserServer.cpp
+          +++ b/iokit/Kernel/IOUserServer.cpp
+          @@ -3209,7 +3209,7 @@ IOUserServer::server(ipc_kmsg_t requestkmsg, ipc_kmsg_t * pReply)
+           		msgout = (typeof(msgout))ikm_header(replykmsg);
+           	}
+           
+          -	IORPC rpc = { .message = msgin, .reply = msgout, .sendSize = msgin->msgh.msgh_size, .replySize = replyAlloc };
+          +	IORPC rpc = { .message = msgin, .reply = msgout, .sendSize = msgin->msgh.msgh_size, .replySize = replyAlloc, .kernelContent = message };
+           
+           	if (object) {
+           		kern_allocation_name_t prior;
+          @@ -3358,6 +3358,7 @@ IOUserServerUEXTTrap(OSObject * object, void * p1, void * p2, void * p3, void *
+           	rpc.sendSize  = mach->msgh.msgh_size;
+           	rpc.reply     = (IORPCMessageMach *) (p + inSize);
+           	rpc.replySize = ((uint32_t) (sizeof(buffer.buffer) - inSize));    // inSize was checked
+          +	rpc.kernelContent = message;
+           
+           	message->objects[0] = 0;
+           	if ((action = OSDynamicCast(OSAction, object))) {
+          -- 
+          2.43.0
+
+          PATCH
+          printf '%s\n' '781e1c06cbfe8c199f4c4bc86842338ba99a3684b6261c9d2987ccd9b32c3906  dxb/patches/0141-sapphire-iorpc-kernelcontent.patch' | shasum -a 256 -c -
+
+          python3 - <<'PY'
+          from pathlib import Path
+
+          script = Path("dxb/build.sh")
+          text = script.read_text()
+          library_line = next(line for line in text.splitlines()
+                              if "xcodebuild install -target libfirehose_kernel " in line)
+          assert library_line.count('ARCHS="x86_64 arm64e"') == 2
+          baseline_library = library_line.replace('ARCHS="x86_64 arm64e"', 'ARCHS="arm64"')
+          baseline_flags = "-march=armv8-a+crypto -mcpu=cortex-a53 -mno-outline-atomics -Xclang -target-feature -Xclang -lse -Xclang -target-feature -Xclang -rcpc"
+          baseline_library += " 'OTHER_CFLAGS=$(inherited) " + baseline_flags + "'"
+          baseline_library += " 'OTHER_CPLUSPLUSFLAGS=$(inherited) " + baseline_flags + "'"
+          text = text.replace(library_line, baseline_library)
+          warning = '                warning "Skipping patch ${PATCH} (already upstream, previously applied, or malformed): ${APPLY_CHECK}"'
+          replacement = '''                case "$(basename "$PATCH")" in
+                              [0-9][0-9][0-9][0-9]-*)
+                                  error "Required X00TD patch failed: ${PATCH}: ${APPLY_CHECK}"
+                                  exit 1
+                                  ;;
+                              *)
+                                  warning "Skipping patch ${PATCH} (already upstream, previously applied, or malformed): ${APPLY_CHECK}"
+                                  ;;
+                          esac'''
+          assert text.count(warning) == 1, "Pinned patch loop changed"
+          text = text.replace(warning, replacement)
+          hook = '    patches\n    venv\n'
+          assert text.count(hook) == 1, "Pinned build entry points changed"
+          text = text.replace(hook, '    patches\n    python3 "${WORK_DIR}/x00td-board-preflight.py"\n    venv\n')
+          script.write_text(text)
+          PY
+
+          cat > dxb/x00td-board-preflight.py <<'PY'
+          from pathlib import Path
+          import re
+          import subprocess
+          
+          root = Path(__file__).resolve().parent
+          output = root.parent / "preflight"
+          output.mkdir(exist_ok=True)
+          tables_path = root / "xnu/iokit/KernelConfigTables.cpp"
+          tables = tables_path.read_text()
+          assert tables.count("'xiaomi,sweet'") == 1
+          assert tables.count("'qcom,kryo470'") == 1
+          tables = tables.replace("'xiaomi,sweet'", "'asus,x00td'")
+          tables = tables.replace("'qcom,kryo470'", "'qcom,sdm636'")
+          tables_path.write_text(tables)
+          platform_path = root / "xnu/iokit/Kernel/arm/SweetPlatformExpert.cpp"
+          platform = platform_path.read_text()
+          assert platform.count('strlcpy(name, "sweet",') == 1
+          assert platform.count('strlcpy(name, "Redmi Note 10 Pro",') == 1
+          platform = platform.replace('strlcpy(name, "sweet",', 'strlcpy(name, "X00TD",')
+          platform = platform.replace('strlcpy(name, "Redmi Note 10 Pro",', 'strlcpy(name, "ASUS ZenFone Max Pro M1",')
+          platform_path.write_text(platform)
+          cpu_path = root / "xnu/iokit/Kernel/arm/SweetCPU.cpp"
+          cpu = cpu_path.read_text().replace('"Kryo 470"', '"Kryo 260"')
+          cpu_path.write_text(cpu)
+          for name in ("SweetPlatformExpert.cpp", "SweetCPU.cpp"):
+              assert name in (root / "xnu/iokit/conf/files.arm64").read_text()
+          assert (root / "xnu/bsd/pthread/sweet_libpthread/kern/kern_init.c").is_file(), "Missing staged pthread provider"
+          assert "char opaque[56]" in (root / "xnu/bsd/sys/pthread_internal.h").read_text()
+          assert "x00td_send_self_sgi();" in cpu
+          zones = (root / "xnu/osfmk/kern/zalloc.c").read_text(encoding="utf-8")
+          assert "#if XNU_PLATFORM_MacOSX && !defined(ARM64_BOARD_CONFIG_SWEET)\n#define ZONE_MAP_MAX" in zones, "Missing compact zone-map patch"
+          copyio = (root / "xnu/osfmk/arm64/copyio.c").read_text()
+          helpers = re.findall(
+              r"static inline void\s+user_access_(?:enable|disable)\(void\)\s*\{.*?\n\}",
+              copyio, re.S,
+          )
+          assert len(helpers) == 2, "Expected both original XNU user-access helpers"
+          probe = output / "board-probe.c"
+          source = """#include <pexpert/arm64/SWEET.h>
+          #if __ARM_PAN_AVAILABLE__
+          #error Baseline X00TD must use the configuration without hardware PAN
+          #endif
+          #ifdef __ARM_16K_PG__
+          #error X00TD requires 4 KiB translation tables
+          #endif
+          #define assert(expression) do { if (!(expression)) __builtin_trap(); } while (0)
+          """
+          zone_policy = re.search(
+              r"(?m)^#if XNU_PLATFORM_MacOSX && !defined\(ARM64_BOARD_CONFIG_SWEET\)\n#define ZONE_MAP_MAX.*?^#endif[^\n]*",
+              zones, re.S,
+          )
+          assert zone_policy, "Cannot locate zone sizing policy"
+          source += "\n#define XNU_PLATFORM_MacOSX 1\n" + zone_policy.group(0) + "\n"
+          source += '_Static_assert(ZONE_MAP_VA_SIZE == (24ULL << 30), "Wrong X00TD zone reservation");\n'
+          source += '_Static_assert(ZONE_MAP_MAX == (8ULL << 30), "Wrong X00TD zone limit");\n'
+          source += "\n".join(helpers)
+          source += "\nvoid x00td_board_probe(void) { user_access_enable(); user_access_disable(); }\n"
+          probe.write_text(source)
+          flags = [
+              "-target", "arm64-apple-macos15.5", "-arch", "arm64",
+              "-DARM64_BOARD_CONFIG_SWEET",
+              "-march=armv8-a+crypto", "-mcpu=cortex-a53", "-mno-outline-atomics",
+              "-Xclang", "-target-feature", "-Xclang", "-lse",
+              "-O0", "-ffreestanding", "-fno-stack-protector",
+              "-I", str(root / "xnu/pexpert"),
+          ]
+          subprocess.run(["xcrun", "clang", *flags, "-S", str(probe),
+                          "-o", str(output / "board-probe.s")], check=True)
+          assembly = (output / "board-probe.s").read_text()
+          assert not re.search(r"\bpan\b", assembly), "Board probe still uses PAN"
+          print("PASS: the patched board header and original XNU copyio helpers compile for baseline ARMv8-A.")
+          commpage = root / "xnu/osfmk/arm/commpage/commpage_asm.s"
+          assembly_flags = flags + [
+              "-DARM64_BOARD_CONFIG_SWEET", "-DASSEMBLER", "-D__ASSEMBLER__",
+              "-I", str(root / "xnu/osfmk"), "-x", "assembler-with-cpp",
+          ]
+          subprocess.run(["xcrun", "clang", *assembly_flags, "-c", str(commpage),
+                          "-o", str(output / "commpage-baseline.o")], check=True)
+          print("PASS: the complete patched commpage assembly compiles with LSE disabled.")
+          PY
+
+      - name: Build XNU
+        working-directory: dxb
+        shell: bash
+        run: |
+          set -euo pipefail
+          if bash build.sh > ../x00td-build.log 2>&1; then
+            tail -n 20 ../x00td-build.log
+          else
+          python3 - <<'PY'
+          import re
+          from collections import deque
+          from pathlib import Path
+
+          errors = deque(maxlen=30)
+          tail = deque(maxlen=30)
+          with Path("../x00td-build.log").open(errors="replace") as log:
+              for number, line in enumerate(log, 1):
+                  tail.append((number, line.rstrip()))
+                  if re.search(r"fatal error:|: error:|undefined symbols|Error [1-9]|BUILD FAILED", line, re.I):
+                      errors.append((number, line.rstrip()))
+          for number, line in errors:
+              print(f"{number}: {line[:2000]}")
+          for number, line in tail:
+              print(f"{number}: {line[:2000]}")
+          PY
+            exit 1
+          fi
+
+      - name: Verify the X00TD changes and collect the kernel
+        shell: bash
+        run: |
+          set -euo pipefail
+          grep -F '0x9d400000 + 2128 * 4320' dxb/xnu/osfmk/arm64/start.s
+          grep -F 'EARLY_HEIGHT 2160u' dxb/xnu/osfmk/arm64/sweet_early.c
+          if grep -E '^#define[[:space:]]+__ARM_16K_PG__' dxb/xnu/pexpert/pexpert/arm64/SWEET.h; then
+            exit 1
+          fi
+          grep -F 'Lx00td_fb_map_next:' dxb/xnu/osfmk/arm64/start.s
+          grep -F 'MACHINE_FLAGS_ARM64_SWEET = -DARM64_BOARD_CONFIG_SWEET                -march=armv8-a+crypto' dxb/xnu/makedefs/MakeInc.def
+          grep -F 'sweet_early_relocate(SWEET_EARLY_FB_VA);' dxb/xnu/osfmk/arm64/arm_vm_init.c
+          grep -F '#define X00TD_FB_BLOCKS 5u' dxb/xnu/osfmk/arm64/arm_vm_init.c
+          grep -F 'CFLAGS_ARM64 += -mcpu=cortex-a53 -mno-outline-atomics -Xclang -target-feature -Xclang -lse' dxb/xnu/makedefs/MakeInc.def
+          grep -F 'kernelContent' dxb/xnu/iokit/IOKit/IORPC.h
+          kernel=dxb/fakeroot/System/Library/Kernels/kernel.development.sweet
+          test -s "$kernel"
+          xcrun lipo "$kernel" -verify_arch arm64
+          python3 - "$kernel" <<'PY'
+          import struct
+          import sys
+          from pathlib import Path
+
+          kernel = Path(sys.argv[1]).read_bytes()
+          from hashlib import sha256
+
+          old_kernel = "0385193011e245defa788e4066831da3f37868c17cef72f293feb26b0fcb3fa8"
+          assert sha256(kernel).hexdigest() != old_kernel, "Kernel still matches the previous LSE build"
+          assert struct.unpack_from("<I", kernel)[0] == 0xfeedfacf, "Expected a thin Mach-O"
+          assert b"SweetPlatformExpert" in kernel, "Missing platform expert class"
+          assert b"SweetCPU" in kernel, "Missing CPU driver class"
+          assert b"SWEET pthread: libpthread-514.100.2 registered" in kernel, "Missing pthread provider"
+          assert b"SWEET PRNG: HMAC-SHA256 registered" in kernel, "Missing kernel HMAC PRNG"
+          assert b"ASUS ZenFone Max Pro M1" in kernel, "Missing X00TD platform identity"
+          assert b"X00TD ZMAP v17: claim" in kernel, "Missing v17 zone diagnostics"
+          assert b"X00TD ZMAP v17: claims exceed largest hole" in kernel, "Missing claim bounds diagnostic"
+          count, = struct.unpack_from("<I", kernel, 16)
+          offset = 32
+          for _ in range(count):
+              command, size = struct.unpack_from("<II", kernel, offset)
+              if command == 0x19 and kernel[offset + 8:offset + 24].rstrip(b"\0") == b"__TEXT":
+                  address, = struct.unpack_from("<Q", kernel, offset + 24)
+                  assert address == 0xfffffff007004000, f"Unexpected XNU link address {address:#x}"
+                  break
+              offset += size
+          else:
+              raise SystemExit("Missing Mach-O __TEXT segment")
+          PY
+          python3 - "$kernel" <<'PY'
+          import struct
+          import sys
+          from pathlib import Path
+
+          data = Path(sys.argv[1]).read_bytes()
+          offset = 32
+          segments = []
+          instruction_ranges = []
+          symbol_table = None
+          for _ in range(struct.unpack_from("<I", data, 16)[0]):
+              command, size = struct.unpack_from("<II", data, offset)
+              if command == 0x19:
+                  _, va, memory_size, file_offset, file_size = struct.unpack_from("<16s4Q", data, offset + 8)
+                  segments.append((va, file_offset, file_size))
+                  if data[offset + 8:offset + 24].rstrip(b"\0") == b"__TEXT_EXEC":
+                      number, = struct.unpack_from("<I", data, offset + 64)
+                      for index in range(number):
+                          section = offset + 72 + index * 80
+                          section_va, length, section_file = struct.unpack_from("<QQI", data, section + 32)
+                          instruction_ranges.append((section_va, section_file, length))
+              elif command == 2:
+                  symbol_table = struct.unpack_from("<4I", data, offset + 8)
+              offset += size
+          assert symbol_table, "Missing kernel symbol table"
+          start, count, strings, string_size = symbol_table
+          symbols = []
+          for index in range(count):
+              name, kind, section, description, address = struct.unpack_from("<IBBHQ", data, start + index * 16)
+              if name < string_size and kind & 0x0e == 0x0e:
+                  end = data.index(b"\0", strings + name)
+                  symbols.append((address, data[strings + name:end]))
+          symbols.sort()
+          # Reject LSE/CAS/RCpc across executable sections, including linked
+          # libraries. K256 is an embedded 256-byte SHA table, not code.
+          constants = [(address, address + 256) for address, name in symbols
+                       if name in (b"K256", b"_K256")]
+          failures = []
+          for va, file_offset, length in instruction_ranges:
+              for position in range(0, length - 3, 4):
+                  address = va + position
+                  if any(low <= address < high for low, high in constants):
+                      continue
+                  word, = struct.unpack_from("<I", data, file_offset + position)
+                  if (word & 0x3f200c00 == 0x38200000 or
+                      word & 0x3fa07c00 in (0x08a07c00, 0x08207c00)):
+                      failures.append((hex(address), hex(word)))
+          assert not failures, f"Unsupported atomic/RCpc instructions remain: {failures[:20]}"
+          print("PASS: all executable sections are free of LSE/CAS/RCpc instructions.")
+          for index, (address, name) in enumerate(symbols):
+              if name == b"_lck_grp_reference":
+                  end = next(value for value, _ in symbols[index + 1:] if value > address)
+                  for va, file_offset, file_size in segments:
+                      if va <= address < end <= va + file_size:
+                          code = data[file_offset + address - va:file_offset + end - va]
+                          instructions = struct.unpack("<" + "I" * (len(code) // 4), code)
+                          assert not any(word & 0x3f200c00 == 0x38200000 for word in instructions), "LSE atomic remains in lck_grp_reference"
+                          print("PASS: lck_grp_reference uses no LSE load/store atomic instruction.")
+                          break
+                  else:
+                      raise SystemExit("Function is outside file-backed kernel segments")
+                  break
+          else:
+              raise SystemExit("Missing lck_grp_reference symbol")
+          PY
+          mkdir -p out
+          cp "$kernel" out/
+          python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          info = {
+              "workflow": "X00TD pthread and IRQ build",
+              "commit": os.environ["GITHUB_SHA"],
+              "run_id": os.environ["GITHUB_RUN_ID"],
+              "run_attempt": os.environ["GITHUB_RUN_ATTEMPT"],
+              "compiler_target": "armv8-a+crypto",
+              "cpu": "cortex-a53",
+              "lse_disabled": True,
+              "hardware_pan": False,
+              "commpage_baseline_atomics": True,
+              "persistent_console": True,
+              "source_kmem_rng": True,
+              "source_self_sgi_enable": True,
+              "pthread_version": "514.100.2",
+              "pthread_commit": "a6c70ca0e544347a0377babf748f831577ec24f9",
+              "source_kernel_hmac_prng": True,
+              "trust_cache_service": "unavailable",
+              "platform_match": "asus,x00td",
+              "cpu_match": "qcom,sdm636",
+              "timer_intid_from_adt": True,
+              "linked_library_baseline": True,
+              "zone_map_va_bytes": 24 << 30,
+              "zone_map_max_bytes": 8 << 30,
+              "translation_page_bytes": 4096,
+          }
+          Path("out/BUILD_INFO.json").write_text(json.dumps(info, indent=2) + "\n")
+          PY
+          (cd out && shasum -a 256 kernel.development.sweet > SHA256SUMS)
+
+      - name: Compress the build log
+        if: always()
+        shell: bash
+        run: |
+          if [ -f x00td-build.log ]; then
+            gzip -f x00td-build.log
+          fi
+
+      - name: Upload build diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: x00td-pthread-build-diagnostics
+          path: |
+            preflight/
+            x00td-build.log.gz
+            dxb/fakeroot/System/Library/Kernels/kernel.development.sweet
+          if-no-files-found: warn
+          retention-days: 14
+
+      - name: Upload the kernel and checksum
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: x00td-xnu-pthread-kernel
+          path: out/
+          if-no-files-found: error
+          retention-days: 14
+
