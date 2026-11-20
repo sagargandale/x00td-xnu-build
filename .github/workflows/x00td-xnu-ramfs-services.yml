@@ -77,7 +77,9 @@ jobs:
            mount=work/'mount';mount.mkdir(exist_ok=True)
            image=work/'template.dmg';out=Path('hfs-template-out').resolve();out.mkdir(exist_ok=True)
            spec=json.loads(Path('hfs-template-files.json').read_text())
-           run('hdiutil','create','-size','64m','-layout','NONE','-fs','Case-sensitive HFS+','-volname','X00TD_RAM','-format','UDRW',str(image))
+           # Sized blank images are read/write by default. -format is accepted for
+           # source-based creation and conversion, not this empty-image invocation.
+           run('hdiutil','create','-size','64m','-layout','NONE','-fs','Case-sensitive HFS+','-volname','X00TD_RAM',str(image))
            run('hdiutil','attach','-nobrowse','-owners','on','-mountpoint',str(mount),str(image))
            records=[]
            try:
